@@ -1,0 +1,26 @@
+// Initial development schema. Add remaining models only after validating source columns and relationships.
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model Patient {
+  id         String  @id
+  name       String?
+  phone      String?
+  age        String?
+  gender     String?
+  address    String?
+  isAllergies String? @map("is_allergies")
+  allergies  String?
+  location   String?
+  distance   String?
+  createdAt  String? @map("created_at")
+  updatedAt  String? @map("updated_at")
+
+  @@map("patients")
+}

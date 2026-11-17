@@ -1,16 +1,15 @@
-import { readSheet, writeSheet } from "../utils/googleSheets.js";
 
+import prisma from "../config/prisma.js";
 import appError from "../utils/appError.js";
 
 /* =========================================================
    CONFIG
 ========================================================= */
 
-const SHEET_NAME = "DisplayMusic";
+const RECORD_ID = "main";
 
 const DEFAULT_MUSIC_VOLUME = 20;
 const DEFAULT_VIDEO_VOLUME = 50;
-
 const DEFAULT_DISPLAY_MODE = "queue";
 
 const ALLOWED_DISPLAY_MODES = ["queue", "video"];
@@ -19,64 +18,57 @@ const ALLOWED_DISPLAY_MODES = ["queue", "video"];
    HELPERS
 ========================================================= */
 
-const normalizeText = (value) => {
-  return String(value ?? "").trim();
-};
+const normalizeText = (value) =>
+  String(value ?? "").trim();
 
 const normalizeBoolean = (value) => {
-  if (value === true || value === 1) {
-    return true;
-  }
+  if (value === true || value === 1) return true;
 
   return ["true", "1", "yes"].includes(
-    String(value ?? "")
-      .trim()
-      .toLowerCase(),
+    String(value ?? "").trim().toLowerCase(),
   );
 };
 
 const normalizeVolume = (value, fallback = 20) => {
   const parsed = Number(value);
 
-  if (!Number.isFinite(parsed)) {
-    return fallback;
-  }
+  if (!Number.isFinite(parsed)) return fallback;
 
-  return Math.min(100, Math.max(0, Math.round(parsed)));
+  return Math.min(
+    100,
+    Math.max(0, Math.round(parsed)),
+  );
 };
 
+const nowIso = () => new Date().toISOString();
+
 /* =========================================================
-   EXTRACT YOUTUBE VIDEO ID
+   YOUTUBE VIDEO ID
 ========================================================= */
 
 const extractYouTubeVideoId = (url) => {
   const normalizedUrl = normalizeText(url);
 
-  if (!normalizedUrl) {
-    return "";
-  }
+  if (!normalizedUrl) return "";
 
   try {
     const parsedUrl = new URL(normalizedUrl);
 
-    const hostname = parsedUrl.hostname.replace(/^www\./, "").toLowerCase();
-
-    /* youtu.be/VIDEO_ID */
+    const hostname = parsedUrl.hostname
+      .replace(/^www\./, "")
+      .toLowerCase();
 
     if (hostname === "youtu.be") {
-      const videoId = parsedUrl.pathname.split("/").filter(Boolean)[0];
-
-      return normalizeText(videoId);
+      return normalizeText(
+        parsedUrl.pathname.split("/").filter(Boolean)[0],
+      );
     }
 
     const isYouTubeHost =
-      hostname === "youtube.com" || hostname.endsWith(".youtube.com");
+      hostname === "youtube.com" ||
+      hostname.endsWith(".youtube.com");
 
-    if (!isYouTubeHost) {
-      return "";
-    }
-
-    /* youtube.com/watch?v=VIDEO_ID */
+    if (!isYouTubeHost) return "";
 
     const queryVideoId = parsedUrl.searchParams.get("v");
 
@@ -84,30 +76,16 @@ const extractYouTubeVideoId = (url) => {
       return normalizeText(queryVideoId);
     }
 
-    const parts = parsedUrl.pathname.split("/").filter(Boolean);
+    const parts = parsedUrl.pathname
+      .split("/")
+      .filter(Boolean);
 
-    /* /embed/VIDEO_ID */
+    for (const type of ["embed", "shorts", "live"]) {
+      const index = parts.indexOf(type);
 
-    const embedIndex = parts.indexOf("embed");
-
-    if (embedIndex !== -1 && parts[embedIndex + 1]) {
-      return normalizeText(parts[embedIndex + 1]);
-    }
-
-    /* /shorts/VIDEO_ID */
-
-    const shortsIndex = parts.indexOf("shorts");
-
-    if (shortsIndex !== -1 && parts[shortsIndex + 1]) {
-      return normalizeText(parts[shortsIndex + 1]);
-    }
-
-    /* /live/VIDEO_ID */
-
-    const liveIndex = parts.indexOf("live");
-
-    if (liveIndex !== -1 && parts[liveIndex + 1]) {
-      return normalizeText(parts[liveIndex + 1]);
+      if (index !== -1 && parts[index + 1]) {
+        return normalizeText(parts[index + 1]);
+      }
     }
 
     return "";
@@ -115,20 +93,6 @@ const extractYouTubeVideoId = (url) => {
     return "";
   }
 };
-
-/* =========================================================
-   GET SETTINGS ROWS
-========================================================= */
-
-async function getSettingsRows() {
-  const rows = await readSheet(SHEET_NAME);
-
-  if (!Array.isArray(rows)) {
-    return [];
-  }
-
-  return rows.filter((row) => row && typeof row === "object");
-}
 
 /* =========================================================
    DEFAULT RECORD
@@ -146,116 +110,129 @@ const createDefaultRecord = () => ({
   video_volume: DEFAULT_VIDEO_VOLUME,
 
   display_mode: DEFAULT_DISPLAY_MODE,
-
   updated_at: null,
 });
 
 /* =========================================================
-   NORMALIZE FULL RECORD
+   PRISMA RESPONSE MAPPER
 ========================================================= */
 
-const normalizeRecord = (record = {}) => {
-  const musicUrl = normalizeText(
-    record.music_youtube_url ?? record.youtube_url,
-  );
+const normalizeRecord = (record) => {
+  if (!record) return createDefaultRecord();
 
-  const musicVideoId =
-    extractYouTubeVideoId(musicUrl) ||
-    normalizeText(record.music_video_id ?? record.video_id);
+  const musicUrl = normalizeText(record.musicYoutubeUrl);
+  const videoUrl = normalizeText(record.videoYoutubeUrl);
 
-  const videoUrl = normalizeText(record.video_youtube_url);
-
-  const videoVideoId =
-    extractYouTubeVideoId(videoUrl) || normalizeText(record.video_video_id);
-
-  const rawMode = normalizeText(record.display_mode).toLowerCase();
-
-  const displayMode = ALLOWED_DISPLAY_MODES.includes(rawMode)
-    ? rawMode
-    : DEFAULT_DISPLAY_MODE;
+  const rawMode = normalizeText(
+    record.displayMode,
+  ).toLowerCase();
 
   return {
     music_youtube_url: musicUrl,
 
-    music_video_id: musicVideoId,
+    music_video_id:
+      extractYouTubeVideoId(musicUrl) ||
+      normalizeText(record.musicVideoId),
 
-    music_playing: normalizeBoolean(record.music_playing ?? record.playing),
+    music_playing: normalizeBoolean(record.musicPlaying),
 
     music_volume: normalizeVolume(
-      record.music_volume ?? record.volume,
+      record.musicVolume,
       DEFAULT_MUSIC_VOLUME,
     ),
 
     video_youtube_url: videoUrl,
 
-    video_video_id: videoVideoId,
+    video_video_id:
+      extractYouTubeVideoId(videoUrl) ||
+      normalizeText(record.videoVideoId),
 
-    video_playing: normalizeBoolean(record.video_playing),
+    video_playing: normalizeBoolean(record.videoPlaying),
 
-    video_volume: normalizeVolume(record.video_volume, DEFAULT_VIDEO_VOLUME),
+    video_volume: normalizeVolume(
+      record.videoVolume,
+      DEFAULT_VIDEO_VOLUME,
+    ),
 
-    display_mode: displayMode,
+    display_mode: ALLOWED_DISPLAY_MODES.includes(rawMode)
+      ? rawMode
+      : DEFAULT_DISPLAY_MODE,
 
-    updated_at: normalizeText(record.updated_at) || null,
+    updated_at: normalizeText(record.updatedAt) || null,
   };
 };
 
 /* =========================================================
-   GET FULL SETTINGS RECORD
+   DATABASE HELPERS
 ========================================================= */
 
 async function getSettingsRecord() {
-  const rows = await getSettingsRows();
-
-  if (!rows.length) {
-    return createDefaultRecord();
-  }
-
-  return normalizeRecord(rows[0]);
-}
-
-/* =========================================================
-   SAVE FULL SETTINGS RECORD
-========================================================= */
-
-async function saveSettingsRecord(record) {
-  const normalized = normalizeRecord({
-    ...record,
-
-    updated_at: new Date().toISOString(),
+  const record = await prisma.displayMusic.findUnique({
+    where: { id: RECORD_ID },
   });
 
-  await writeSheet(SHEET_NAME, [normalized]);
+  return normalizeRecord(record);
+}
 
-  return normalized;
+/*
+ * Apply only the fields being changed.
+ *
+ * This avoids the old read-modify-write behavior
+ * that could overwrite unrelated settings.
+ */
+async function updateSettings(patch) {
+  const timestamp = nowIso();
+
+  const saved = await prisma.displayMusic.upsert({
+    where: {
+      id: RECORD_ID,
+    },
+
+    create: {
+      id: RECORD_ID,
+      ...patch,
+      updatedAt: timestamp,
+    },
+
+    update: {
+      ...patch,
+      updatedAt: timestamp,
+    },
+  });
+
+  return normalizeRecord(saved);
 }
 
 /* =========================================================
-   MUSIC
+   RESPONSE HELPERS
 ========================================================= */
 
+const musicResponse = (record) => ({
+  youtube_url: record.music_youtube_url,
+  video_id: record.music_video_id,
+  playing: record.music_playing,
+  volume: record.music_volume,
+  updated_at: record.updated_at,
+});
+
+const videoResponse = (record) => ({
+  youtube_url: record.video_youtube_url,
+  video_id: record.video_video_id,
+  playing: record.video_playing,
+  volume: record.video_volume,
+  updated_at: record.updated_at,
+});
+
 /* =========================================================
-   GET DISPLAY MUSIC
+   1. GET DISPLAY MUSIC
 ========================================================= */
 
 export async function getDisplayMusic() {
-  const record = await getSettingsRecord();
-
-  return {
-    youtube_url: record.music_youtube_url,
-
-    video_id: record.music_video_id,
-
-    playing: record.music_playing,
-
-    volume: record.music_volume,
-
-    updated_at: record.updated_at,
-  };
+  return musicResponse(await getSettingsRecord());
 }
 
 /* =========================================================
-   UPDATE DISPLAY MUSIC
+   2. UPDATE DISPLAY MUSIC
 ========================================================= */
 
 export async function updateDisplayMusic({
@@ -275,57 +252,33 @@ export async function updateDisplayMusic({
     throw appError("Invalid YouTube URL.", 400);
   }
 
-  const record = await getSettingsRecord();
+  const saved = await updateSettings({
+    musicYoutubeUrl: normalizedUrl,
+    musicVideoId: videoId,
+    musicPlaying: normalizeBoolean(playing),
+    musicVolume: normalizeVolume(
+      volume,
+      DEFAULT_MUSIC_VOLUME,
+    ),
+  });
 
-  record.music_youtube_url = normalizedUrl;
-
-  record.music_video_id = videoId;
-
-  record.music_playing = normalizeBoolean(playing);
-
-  record.music_volume = normalizeVolume(volume, DEFAULT_MUSIC_VOLUME);
-
-  const saved = await saveSettingsRecord(record);
-
-  return {
-    youtube_url: saved.music_youtube_url,
-
-    video_id: saved.music_video_id,
-
-    playing: saved.music_playing,
-
-    volume: saved.music_volume,
-
-    updated_at: saved.updated_at,
-  };
+  return musicResponse(saved);
 }
 
 /* =========================================================
-   UPDATE MUSIC PLAYING STATE
+   3. UPDATE MUSIC PLAYING STATE
 ========================================================= */
 
 export async function updatePlayingState(playing) {
-  const record = await getSettingsRecord();
+  const saved = await updateSettings({
+    musicPlaying: normalizeBoolean(playing),
+  });
 
-  record.music_playing = normalizeBoolean(playing);
-
-  const saved = await saveSettingsRecord(record);
-
-  return {
-    youtube_url: saved.music_youtube_url,
-
-    video_id: saved.music_video_id,
-
-    playing: saved.music_playing,
-
-    volume: saved.music_volume,
-
-    updated_at: saved.updated_at,
-  };
+  return musicResponse(saved);
 }
 
 /* =========================================================
-   UPDATE MUSIC VOLUME
+   4. UPDATE MUSIC VOLUME
 ========================================================= */
 
 export async function updateVolume(volume) {
@@ -339,51 +292,26 @@ export async function updateVolume(volume) {
     throw appError("Volume must be between 0 and 100.", 400);
   }
 
-  const record = await getSettingsRecord();
+  const saved = await updateSettings({
+    musicVolume: normalizeVolume(
+      parsedVolume,
+      DEFAULT_MUSIC_VOLUME,
+    ),
+  });
 
-  record.music_volume = normalizeVolume(parsedVolume, DEFAULT_MUSIC_VOLUME);
-
-  const saved = await saveSettingsRecord(record);
-
-  return {
-    youtube_url: saved.music_youtube_url,
-
-    video_id: saved.music_video_id,
-
-    playing: saved.music_playing,
-
-    volume: saved.music_volume,
-
-    updated_at: saved.updated_at,
-  };
+  return musicResponse(saved);
 }
 
 /* =========================================================
-   VIDEO
-========================================================= */
-
-/* =========================================================
-   GET DISPLAY VIDEO
+   5. GET DISPLAY VIDEO
 ========================================================= */
 
 export async function getDisplayVideo() {
-  const record = await getSettingsRecord();
-
-  return {
-    youtube_url: record.video_youtube_url,
-
-    video_id: record.video_video_id,
-
-    playing: record.video_playing,
-
-    volume: record.video_volume,
-
-    updated_at: record.updated_at,
-  };
+  return videoResponse(await getSettingsRecord());
 }
 
 /* =========================================================
-   UPDATE / CHANGE DISPLAY VIDEO
+   6. UPDATE DISPLAY VIDEO
 ========================================================= */
 
 export async function updateDisplayVideo({
@@ -394,7 +322,10 @@ export async function updateDisplayVideo({
   const normalizedUrl = normalizeText(youtube_url);
 
   if (!normalizedUrl) {
-    throw appError("Video YouTube URL is required.", 400);
+    throw appError(
+      "Video YouTube URL is required.",
+      400,
+    );
   }
 
   const videoId = extractYouTubeVideoId(normalizedUrl);
@@ -403,66 +334,69 @@ export async function updateDisplayVideo({
     throw appError("Invalid YouTube URL.", 400);
   }
 
-  const record = await getSettingsRecord();
+  const saved = await updateSettings({
+    videoYoutubeUrl: normalizedUrl,
+    videoVideoId: videoId,
+    videoPlaying: normalizeBoolean(playing),
+    videoVolume: normalizeVolume(
+      volume,
+      DEFAULT_VIDEO_VOLUME,
+    ),
+  });
 
-  record.video_youtube_url = normalizedUrl;
-
-  record.video_video_id = videoId;
-
-  record.video_playing = normalizeBoolean(playing);
-
-  record.video_volume = normalizeVolume(volume, DEFAULT_VIDEO_VOLUME);
-
-  const saved = await saveSettingsRecord(record);
-
-  return {
-    youtube_url: saved.video_youtube_url,
-
-    video_id: saved.video_video_id,
-
-    playing: saved.video_playing,
-
-    volume: saved.video_volume,
-
-    updated_at: saved.updated_at,
-  };
+  return videoResponse(saved);
 }
 
 /* =========================================================
-   UPDATE VIDEO PLAYING STATE
+   7. UPDATE VIDEO PLAYING STATE
 ========================================================= */
 
 export async function updateVideoPlayingState(playing) {
-  const record = await getSettingsRecord();
+  const shouldPlay = normalizeBoolean(playing);
 
   /*
-   * Cannot play a video if no video
-   * has been configured.
+   * Atomic conditional update prevents a video
+   * from being started after it was removed.
    */
+  return prisma.$transaction(async (tx) => {
+    await tx.$executeRaw`
+      SELECT pg_advisory_xact_lock(918273645)
+    `;
 
-  if (normalizeBoolean(playing) && !record.video_video_id) {
-    throw appError("No display video is configured.", 400);
-  }
+    const current = await tx.displayMusic.findUnique({
+      where: { id: RECORD_ID },
+    });
 
-  record.video_playing = normalizeBoolean(playing);
+    const record = normalizeRecord(current);
 
-  const saved = await saveSettingsRecord(record);
+    if (shouldPlay && !record.video_video_id) {
+      throw appError(
+        "No display video is configured.",
+        400,
+      );
+    }
 
-  return {
-    youtube_url: saved.video_youtube_url,
+    const saved = await tx.displayMusic.upsert({
+      where: { id: RECORD_ID },
 
-    video_id: saved.video_video_id,
+      create: {
+        id: RECORD_ID,
+        videoPlaying: shouldPlay,
+        updatedAt: nowIso(),
+      },
 
-    playing: saved.video_playing,
+      update: {
+        videoPlaying: shouldPlay,
+        updatedAt: nowIso(),
+      },
+    });
 
-    volume: saved.video_volume,
-
-    updated_at: saved.updated_at,
-  };
+    return videoResponse(normalizeRecord(saved));
+  });
 }
 
 /* =========================================================
-   UPDATE VIDEO VOLUME
+   8. UPDATE VIDEO VOLUME
 ========================================================= */
 
 export async function updateVideoVolume(volume) {
@@ -476,69 +410,58 @@ export async function updateVideoVolume(volume) {
     throw appError("Volume must be between 0 and 100.", 400);
   }
 
-  const record = await getSettingsRecord();
+  const saved = await updateSettings({
+    videoVolume: normalizeVolume(
+      parsedVolume,
+      DEFAULT_VIDEO_VOLUME,
+    ),
+  });
 
-  record.video_volume = normalizeVolume(parsedVolume, DEFAULT_VIDEO_VOLUME);
-
-  const saved = await saveSettingsRecord(record);
-
-  return {
-    youtube_url: saved.video_youtube_url,
-
-    video_id: saved.video_video_id,
-
-    playing: saved.video_playing,
-
-    volume: saved.video_volume,
-
-    updated_at: saved.updated_at,
-  };
+  return videoResponse(saved);
 }
 
 /* =========================================================
-   REMOVE DISPLAY VIDEO
+   9. REMOVE DISPLAY VIDEO
 ========================================================= */
 
 export async function removeDisplayVideo() {
-  const record = await getSettingsRecord();
+  return prisma.$transaction(async (tx) => {
+    await tx.$executeRaw`
+      SELECT pg_advisory_xact_lock(918273645)
+    `;
 
-  record.video_youtube_url = "";
-  record.video_video_id = "";
-  record.video_playing = false;
+    const saved = await tx.displayMusic.upsert({
+      where: { id: RECORD_ID },
 
-  /*
-   * If video is removed while the
-   * display is in video mode,
-   * automatically return to queue.
-   */
+      create: {
+        id: RECORD_ID,
+        videoYoutubeUrl: "",
+        videoVideoId: "",
+        videoPlaying: false,
+        displayMode: "queue",
+        updatedAt: nowIso(),
+      },
 
-  if (record.display_mode === "video") {
-    record.display_mode = "queue";
-  }
+      update: {
+        videoYoutubeUrl: "",
+        videoVideoId: "",
+        videoPlaying: false,
+        displayMode: "queue",
+        updatedAt: nowIso(),
+      },
+    });
 
-  const saved = await saveSettingsRecord(record);
+    const record = normalizeRecord(saved);
 
-  return {
-    youtube_url: saved.video_youtube_url,
-
-    video_id: saved.video_video_id,
-
-    playing: saved.video_playing,
-
-    volume: saved.video_volume,
-
-    display_mode: saved.display_mode,
-
-    updated_at: saved.updated_at,
-  };
+    return {
+      ...videoResponse(record),
+      display_mode: record.display_mode,
+    };
+  });
 }
 
 /* =========================================================
-   DISPLAY MODE
-========================================================= */
-
-/* =========================================================
-   GET DISPLAY MODE
+   10. GET DISPLAY MODE
 ========================================================= */
 
 export async function getDisplayMode() {
@@ -546,91 +469,91 @@ export async function getDisplayMode() {
 
   return {
     mode: record.display_mode,
-
     video_playing: record.video_playing,
-
     updated_at: record.updated_at,
   };
 }
 
 /* =========================================================
-   UPDATE DISPLAY MODE
+   11. UPDATE DISPLAY MODE
 ========================================================= */
 
 export async function updateDisplayMode(mode) {
   const normalizedMode = normalizeText(mode).toLowerCase();
 
   if (!ALLOWED_DISPLAY_MODES.includes(normalizedMode)) {
-    throw appError("Display mode must be queue or video.", 400);
+    throw appError(
+      "Display mode must be queue or video.",
+      400,
+    );
   }
 
-  const record = await getSettingsRecord();
+  return prisma.$transaction(async (tx) => {
+    await tx.$executeRaw`
+      SELECT pg_advisory_xact_lock(918273645)
+    `;
 
-  /*
-   * IMPORTANT:
-   *
-   * When the user switches from
-   * video -> queue,
-   * pause the video automatically.
-   */
+    const current = await tx.displayMusic.findUnique({
+      where: { id: RECORD_ID },
+    });
 
-  if (normalizedMode === "queue") {
-    record.video_playing = false;
-  }
+    const record = normalizeRecord(current);
 
-  /*
-   * Do not allow switching to
-   * video mode if there is no
-   * configured video.
-   */
+    if (
+      normalizedMode === "video" &&
+      !record.video_video_id
+    ) {
+      throw appError(
+        "No display video is configured.",
+        400,
+      );
+    }
 
-  if (normalizedMode === "video" && !record.video_video_id) {
-    throw appError("No display video is configured.", 400);
-  }
+    const patch = {
+      displayMode: normalizedMode,
+      updatedAt: nowIso(),
+    };
 
-  record.display_mode = normalizedMode;
+    if (normalizedMode === "queue") {
+      patch.videoPlaying = false;
+    }
 
-  const saved = await saveSettingsRecord(record);
+    const saved = await tx.displayMusic.upsert({
+      where: { id: RECORD_ID },
+      create: {
+        id: RECORD_ID,
+        ...patch,
+      },
+      update: patch,
+    });
 
-  return {
-    mode: saved.display_mode,
+    const updated = normalizeRecord(saved);
 
-    video: {
-      youtube_url: saved.video_youtube_url,
+    return {
+      mode: updated.display_mode,
 
-      video_id: saved.video_video_id,
+      video: {
+        youtube_url: updated.video_youtube_url,
+        video_id: updated.video_video_id,
+        playing: updated.video_playing,
+        volume: updated.video_volume,
+      },
 
-      playing: saved.video_playing,
-
-      volume: saved.video_volume,
-    },
-
-    updated_at: saved.updated_at,
-  };
+      updated_at: updated.updated_at,
+    };
+  });
 }
 
 /* =========================================================
-   RESET DISPLAY MUSIC
+   12. RESET DISPLAY MUSIC
 ========================================================= */
 
 export async function resetDisplayMusic() {
-  const record = await getSettingsRecord();
+  const saved = await updateSettings({
+    musicYoutubeUrl: "",
+    musicVideoId: "",
+    musicPlaying: false,
+  });
 
-  record.music_youtube_url = "";
-  record.music_video_id = "";
-  record.music_playing = false;
-
-  const saved = await saveSettingsRecord(record);
-
-  return {
-    youtube_url: saved.music_youtube_url,
-
-    video_id: saved.music_video_id,
-
-    playing: saved.music_playing,
-
-    volume: saved.music_volume,
-
-    updated_at: saved.updated_at,
-  };
+  return musicResponse(saved);
 }

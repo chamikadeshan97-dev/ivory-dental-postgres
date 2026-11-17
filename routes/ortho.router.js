@@ -18,12 +18,13 @@ import {
   /* =====================================================
      VISITS
   ===================================================== */
-  deleteOrthoCasePermanently,
+  
+  
   createOrthoVisit,
   getOrthoVisitsByCase,
   getOrthoVisitById,
   updateOrthoVisit,
-  deleteOrthoVisit,
+  
 
   /* =====================================================
      PAYMENTS
@@ -77,7 +78,7 @@ router.get("/visits/:visitId", getOrthoVisitById);
 
 router.patch("/visits/:visitId", updateOrthoVisit);
 
-router.delete("/visits/:visitId", deleteOrthoVisit);
+
 /* ========================================================
    PERMANENTLY DELETE ORTHO CASE
 ======================================================== */
@@ -90,7 +91,6 @@ router.delete(
   "/cases/:caseId/permanent",
   // requireAuthentication,
   // requireAdminPermission,
-  deleteOrthoCasePermanently,
 );
 
 /* ========================================================

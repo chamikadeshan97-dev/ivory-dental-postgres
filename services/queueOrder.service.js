@@ -1,9 +1,8 @@
-import * as googleSheets from "../utils/googleSheets.js";
 
-const SHEET_NAME = "QueueOrder";
+import prisma from "../config/prisma.js";
 
 /* ========================================================
-   Helpers
+   HELPERS
 ======================================================== */
 
 const normalize = (value) =>
@@ -13,7 +12,7 @@ const nowIso = () =>
   new Date().toISOString();
 
 /* ========================================================
-   Parse saved queue array safely
+   PARSE QUEUE ORDER SAFELY
 ======================================================== */
 
 const parseQueueOrder = (value) => {
@@ -22,7 +21,10 @@ const parseQueueOrder = (value) => {
   }
 
   try {
-    const parsed = JSON.parse(value);
+    const parsed =
+      typeof value === "string"
+        ? JSON.parse(value)
+        : value;
 
     if (!Array.isArray(parsed)) {
       return [];
@@ -34,7 +36,7 @@ const parseQueueOrder = (value) => {
   } catch (error) {
     console.error(
       "Failed to parse queue_order:",
-      error
+      error,
     );
 
     return [];
@@ -42,49 +44,55 @@ const parseQueueOrder = (value) => {
 };
 
 /* ========================================================
-   Get Queue By Date
+   FORMAT QUEUE RESPONSE
 ======================================================== */
 
-export const getQueueByDate = async (
-  date
-) => {
-  if (!date) {
-    throw new Error("Date is required");
-  }
-
-  const rows =
-    await googleSheets.readSheet(
-      SHEET_NAME
-    );
-
-  const record = rows.find(
-    (row) =>
-      normalize(row.date) ===
-      normalize(date)
-  );
-
+const formatQueue = (record) => {
   if (!record) {
-    return {
-      date: normalize(date),
-      queue_order: [],
-      updated_at: null,
-    };
+    return null;
   }
 
   return {
     date: normalize(record.date),
 
     queue_order: parseQueueOrder(
-      record.queue_order
+      record.queueOrder,
     ),
 
-    updated_at:
-      record.updated_at || null,
+    updated_at: record.updatedAt || null,
   };
 };
 
 /* ========================================================
-   Save Daily Queue
+   1. GET QUEUE BY DATE
+======================================================== */
+
+export const getQueueByDate = async (date) => {
+  if (!date) {
+    throw new Error("Date is required");
+  }
+
+  const normalizedDate = normalize(date);
+
+  const record = await prisma.queueOrder.findUnique({
+    where: {
+      date: normalizedDate,
+    },
+  });
+
+  if (!record) {
+    return {
+      date: normalizedDate,
+      queue_order: [],
+      updated_at: null,
+    };
+  }
+
+  return formatQueue(record);
+};
+
+/* ========================================================
+   2. SAVE DAILY QUEUE
 ======================================================== */
 
 export const saveQueue = async ({
@@ -97,25 +105,22 @@ export const saveQueue = async ({
 
   if (!Array.isArray(queue_order)) {
     throw new Error(
-      "queue_order must be an array"
+      "queue_order must be an array",
     );
   }
 
-  /*
-   * Clean appointment IDs
-   */
-
-  const cleanedQueue =
-    queue_order
-      .map((item) =>
-        normalize(item)
-      )
-      .filter(Boolean);
+  const normalizedDate = normalize(date);
 
   /*
-   * Prevent duplicates
+   * Clean appointment IDs.
    */
+  const cleanedQueue = queue_order
+    .map((item) => normalize(item))
+    .filter(Boolean);
 
+  /*
+   * Prevent duplicate appointment IDs.
+   */
   const uniqueQueue = [
     ...new Set(cleanedQueue),
   ];
@@ -125,79 +130,46 @@ export const saveQueue = async ({
     cleanedQueue.length
   ) {
     throw new Error(
-      "Duplicate appointments are not allowed in the queue"
+      "Duplicate appointments are not allowed in the queue",
     );
   }
-
-  const rows =
-    await googleSheets.readSheet(
-      SHEET_NAME
-    );
 
   const timestamp = nowIso();
 
-  let found = false;
-
-  const updatedRows = rows.map(
-    (row) => {
-      if (
-        normalize(row.date) ===
-        normalize(date)
-      ) {
-        found = true;
-
-        return {
-          date: normalize(date),
-
-          queue_order:
-            JSON.stringify(
-              uniqueQueue
-            ),
-
-          updated_at: timestamp,
-        };
-      }
-
-      return row;
-    }
-  );
-
   /*
-   * No queue exists for this day yet
+   * Create a new daily queue or replace
+   * the existing queue for that date.
+   *
+   * Prisma upsert is atomic.
    */
+  const savedQueue = await prisma.queueOrder.upsert({
+    where: {
+      date: normalizedDate,
+    },
 
-  if (!found) {
-    updatedRows.push({
-      date: normalize(date),
+    create: {
+      date: normalizedDate,
 
-      queue_order:
-        JSON.stringify(
-          uniqueQueue
-        ),
+      queueOrder: uniqueQueue,
 
-      updated_at: timestamp,
-    });
-  }
+      updatedAt: timestamp,
+    },
 
-  await googleSheets.writeSheet(
-    SHEET_NAME,
-    updatedRows
-  );
+    update: {
+      queueOrder: uniqueQueue,
 
-  return {
-    date: normalize(date),
-    queue_order: uniqueQueue,
-    updated_at: timestamp,
-  };
+      updatedAt: timestamp,
+    },
+  });
+
+  return formatQueue(savedQueue);
 };
 
 /* ========================================================
-   Clear Queue
+   3. CLEAR DAILY QUEUE
 ======================================================== */
 
-export const clearQueue = async (
-  date
-) => {
+export const clearQueue = async (date) => {
   return saveQueue({
     date,
     queue_order: [],

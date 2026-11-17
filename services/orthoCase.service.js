@@ -1,236 +1,395 @@
-import { readSheet, writeSheet } from "../utils/googleSheets.js";
 
-const SHEET = "Ortho_Cases";
-const PATIENTS_SHEET = "Patients";
-const ORTHO_PAYMENTS_SHEET = "Ortho_Payments";
-const protectedFields = ["ortho_case_id", "patient_id", "created_at"];
+import prisma from "../config/prisma.js";
 
-const clean = (value) => String(value ?? "").trim();
+/* ========================================================
+   CONFIGURATION
+======================================================== */
 
-const normalize = (value) => clean(value).toLowerCase();
+const PROTECTED_FIELDS = [
+  "ortho_case_id",
+  "patient_id",
+  "created_at",
+];
 
-const nowISO = () => new Date().toISOString();
+const ALLOWED_STATUSES = [
+  "Active",
+  "On Hold",
+  "Completed",
+  "Cancelled",
+];
 
-const todayISO = () => new Date().toISOString().split("T")[0];
+/* ========================================================
+   HELPERS
+======================================================== */
+
+const clean = (value) =>
+  String(value ?? "").trim();
+
+const normalize = (value) =>
+  clean(value).toLowerCase();
+
+const nowISO = () =>
+  new Date().toISOString();
+
+const todayISO = () =>
+  new Date().toISOString().split("T")[0];
 
 const toNumber = (value) => {
   const number = Number(value);
+
   return Number.isFinite(number) ? number : 0;
 };
 
-const generateNextId = (rows, fieldName, prefix) => {
+const createError = (message, status = 400) => {
+  const error = new Error(message);
+
+  error.status = status;
+  error.statusCode = status;
+
+  return error;
+};
+
+/* ========================================================
+   ID GENERATION
+======================================================== */
+
+const generateNextId = (rows) => {
   let max = 0;
 
   rows.forEach((row) => {
-    const id = clean(row?.[fieldName]);
+    const id = clean(row.orthoCaseId);
 
-    if (!id.startsWith(`${prefix}_`)) {
-      return;
-    }
+    const match = id.match(/^ORT_(\d+)$/i);
 
-    const number = Number(id.replace(`${prefix}_`, ""));
+    if (!match) return;
+
+    const number = Number(match[1]);
 
     if (Number.isFinite(number) && number > max) {
       max = number;
     }
   });
 
-  return `${prefix}_${String(max + 1).padStart(4, "0")}`;
+  return `ORT_${String(max + 1).padStart(4, "0")}`;
 };
 
-export const createOrthoCaseService = async (payload) => {
-  const cases = (await readSheet(SHEET)) || [];
+/* ========================================================
+   RESPONSE FORMATTER
+======================================================== */
 
-  const record = {
-    ortho_case_id: generateNextId(cases, "ortho_case_id", "ORT"),
+const formatOrthoCase = (record) => {
+  if (!record) return null;
 
-    patient_id: clean(payload.patient_id),
-    dentist_id: clean(payload.dentist_id),
+  return {
+    ortho_case_id: record.orthoCaseId,
+    patient_id: record.patientId,
+    dentist_id: record.dentistId ?? "",
 
-    start_date: clean(payload.start_date) || todayISO(),
+    start_date: record.startDate ?? "",
+    treatment_type: record.treatmentType ?? "",
+    treatment_area: record.treatmentArea ?? "",
+    diagnosis: record.diagnosis ?? "",
+    estimated_duration: record.estimatedDuration ?? "",
 
-    treatment_type: clean(payload.treatment_type),
+    total_treatment_fee: toNumber(
+      record.totalTreatmentFee,
+    ),
 
-    treatment_area: clean(payload.treatment_area),
+    payment_plan: record.paymentPlan ?? "",
 
-    diagnosis: clean(payload.diagnosis),
+    monthly_payment: toNumber(
+      record.monthlyPayment,
+    ),
 
-    estimated_duration: clean(payload.estimated_duration),
+    next_visit_date: record.nextVisitDate ?? "",
+    status: record.status ?? "",
+    notes: record.notes ?? "",
+    completed_date: record.completedDate ?? "",
 
-    total_treatment_fee: toNumber(payload.total_treatment_fee),
-
-    payment_plan: clean(payload.payment_plan),
-
-    monthly_payment: toNumber(payload.monthly_payment),
-
-    next_visit_date: clean(payload.next_visit_date),
-
-    status: "Active",
-
-    notes: clean(payload.notes),
-
-    completed_date: "",
-
-    created_at: nowISO(),
-    updated_at: nowISO(),
+    created_at: record.createdAt ?? "",
+    updated_at: record.updatedAt ?? "",
   };
-
-  cases.push(record);
-
-  await writeSheet(SHEET, cases);
-
-  return record;
 };
 
 /* ========================================================
-   GET ALL ORTHO CASES WITH PATIENT DETAILS
+   DATABASE HELPERS
 ======================================================== */
+
+const findCaseById = async (
+  caseId,
+  db = prisma,
+) => {
+  return db.orthoCase.findFirst({
+    where: {
+      orthoCaseId: {
+        equals: clean(caseId),
+        mode: "insensitive",
+      },
+    },
+  });
+};
 
 /* ========================================================
-   SHEET CONFIGURATION
+   1. CREATE ORTHO CASE
 ======================================================== */
 
-/* ========================================================
-   PAYMENT HELPERS
-======================================================== */
+export const createOrthoCaseService = async (
+  payload = {},
+) => {
+  return prisma.$transaction(
+    async (tx) => {
+      /*
+       * Serialize ID generation to avoid
+       * duplicate ORT numbers.
+       */
+      await tx.$executeRaw`
+        LOCK TABLE "ortho_cases"
+        IN EXCLUSIVE MODE
+      `;
 
-const getPaymentAmount = (payment) => {
-  return toNumber(
-    payment.payment_amount ?? payment.amount ?? payment.paid_amount ?? 0,
+      const existingCases =
+        await tx.orthoCase.findMany({
+          select: {
+            orthoCaseId: true,
+          },
+        });
+
+      const timestamp = nowISO();
+
+      const record = await tx.orthoCase.create({
+        data: {
+          orthoCaseId: generateNextId(
+            existingCases,
+          ),
+
+          patientId: clean(
+            payload.patient_id,
+          ),
+
+          dentistId: clean(
+            payload.dentist_id,
+          ),
+
+          startDate:
+            clean(payload.start_date) ||
+            todayISO(),
+
+          treatmentType: clean(
+            payload.treatment_type,
+          ),
+
+          treatmentArea: clean(
+            payload.treatment_area,
+          ),
+
+          diagnosis: clean(
+            payload.diagnosis,
+          ),
+
+          estimatedDuration: clean(
+            payload.estimated_duration,
+          ),
+
+          totalTreatmentFee: toNumber(
+            payload.total_treatment_fee,
+          ),
+
+          paymentPlan: clean(
+            payload.payment_plan,
+          ),
+
+          monthlyPayment: toNumber(
+            payload.monthly_payment,
+          ),
+
+          nextVisitDate: clean(
+            payload.next_visit_date,
+          ),
+
+          status: "Active",
+
+          notes: clean(
+            payload.notes,
+          ),
+
+          completedDate: "",
+
+          createdAt: timestamp,
+          updatedAt: timestamp,
+        },
+      });
+
+      return formatOrthoCase(record);
+    },
+    {
+      timeout: 15000,
+    },
   );
 };
 
 /* ========================================================
-   GET ALL ORTHO CASES WITH PATIENTS AND PAYMENTS
+   2. GET ALL ORTHO CASES WITH PATIENTS AND PAYMENTS
 ======================================================== */
 
-export const getAllOrthoCasesService = async (filters = {}) => {
-  /* ======================================================
-     LOAD ALL THREE SHEETS
-  ====================================================== */
-
-  const [caseData, patientData, paymentData] = await Promise.all([
-    readSheet(SHEET),
-    readSheet(PATIENTS_SHEET),
-    readSheet(ORTHO_PAYMENTS_SHEET),
+export const getAllOrthoCasesService = async (
+  filters = {},
+) => {
+  const [
+    caseData,
+    patientData,
+    paymentData,
+  ] = await Promise.all([
+    prisma.orthoCase.findMany(),
+    prisma.patient.findMany(),
+    prisma.orthoPayment.findMany(),
   ]);
 
-  let cases = Array.isArray(caseData) ? caseData : [];
-
-  const patients = Array.isArray(patientData) ? patientData : [];
-
-  const payments = Array.isArray(paymentData) ? paymentData : [];
-
-  /* ======================================================
-     CREATE PATIENT LOOKUP
-  ====================================================== */
+  /* ----------------------------------------------------
+     PATIENT LOOKUP
+  ---------------------------------------------------- */
 
   const patientMap = new Map();
 
-  patients.forEach((patient) => {
-    const patientId = normalize(patient.patient_id || patient.id);
+  patientData.forEach((patient) => {
+    const patientId = normalize(patient.id);
 
     if (patientId) {
       patientMap.set(patientId, patient);
     }
   });
 
-  /* ======================================================
-     CALCULATE TOTAL PAID FOR EACH ORTHO CASE
-  ====================================================== */
+  /* ----------------------------------------------------
+     PAYMENT TOTALS
+  ---------------------------------------------------- */
 
   const paymentsMap = new Map();
 
-  payments.forEach((payment) => {
-    const caseId = normalize(payment.ortho_case_id);
+  paymentData.forEach((payment) => {
+    const caseId = normalize(
+      payment.orthoCaseId,
+    );
 
-    if (!caseId) {
-      return;
-    }
+    if (!caseId) return;
 
-    const amount = getPaymentAmount(payment);
+    const amount = toNumber(
+      payment.amount,
+    );
 
-    const previousTotal = paymentsMap.get(caseId) || 0;
+    const previousTotal =
+      paymentsMap.get(caseId) || 0;
 
-    paymentsMap.set(caseId, previousTotal + amount);
+    paymentsMap.set(
+      caseId,
+      previousTotal + amount,
+    );
   });
 
-  /* ======================================================
-     COMBINE CASE + PATIENT + PAYMENT DATA
-  ====================================================== */
+  /* ----------------------------------------------------
+     COMBINE RECORDS
+  ---------------------------------------------------- */
 
-  cases = cases.map((item) => {
-    const caseId = normalize(item.ortho_case_id);
+  let cases = caseData.map((item) => {
+    const record = formatOrthoCase(item);
 
-    const patientId = normalize(item.patient_id);
+    const patient = patientMap.get(
+      normalize(record.patient_id),
+    );
 
-    const patient = patientMap.get(patientId);
+    const totalFee =
+      record.total_treatment_fee;
 
-    const totalFee = toNumber(item.total_treatment_fee);
+    const totalPaid =
+      paymentsMap.get(
+        normalize(record.ortho_case_id),
+      ) || 0;
 
-    const totalPaid = paymentsMap.get(caseId) || 0;
-
-    const balance = Math.max(totalFee - totalPaid, 0);
+    const balance = Math.max(
+      totalFee - totalPaid,
+      0,
+    );
 
     return {
-      ...item,
+      ...record,
 
-      patient_name: patient ? clean(patient.name || patient.patient_name) : "",
+      patient_name: patient
+        ? clean(patient.name)
+        : "",
 
       patient_mobile: patient
-        ? clean(patient.phone || patient.mobile || patient.mobile_number)
+        ? clean(patient.phone)
         : "",
 
       total_treatment_fee: totalFee,
 
       total_paid: totalPaid,
 
-      balance: balance,
+      balance,
     };
   });
 
-  /* ======================================================
+  /* ----------------------------------------------------
      STATUS FILTER
-  ====================================================== */
+  ---------------------------------------------------- */
 
   if (clean(filters.status)) {
     cases = cases.filter(
-      (item) => normalize(item.status) === normalize(filters.status),
+      (item) =>
+        normalize(item.status) ===
+        normalize(filters.status),
     );
   }
 
-  /* ======================================================
+  /* ----------------------------------------------------
      DENTIST FILTER
-  ====================================================== */
+  ---------------------------------------------------- */
 
   if (clean(filters.dentist_id)) {
     cases = cases.filter(
-      (item) => normalize(item.dentist_id) === normalize(filters.dentist_id),
+      (item) =>
+        normalize(item.dentist_id) ===
+        normalize(filters.dentist_id),
     );
   }
 
-  /* ======================================================
+  /* ----------------------------------------------------
      SEARCH FILTER
-  ====================================================== */
+  ---------------------------------------------------- */
 
   if (clean(filters.search)) {
-    const keyword = normalize(filters.search);
+    const keyword = normalize(
+      filters.search,
+    );
 
     cases = cases.filter((item) =>
-      Object.values(item).some((value) => normalize(value).includes(keyword)),
+      Object.values(item).some(
+        (value) =>
+          normalize(value).includes(
+            keyword,
+          ),
+      ),
     );
   }
 
-  /* ======================================================
-     SORT BY LATEST UPDATED
-  ====================================================== */
+  /* ----------------------------------------------------
+     SORT BY LATEST UPDATE
+  ---------------------------------------------------- */
 
   cases.sort((a, b) => {
-    const dateA = Date.parse(a.updated_at);
-    const dateB = Date.parse(b.updated_at);
+    const dateA = Date.parse(
+      a.updated_at,
+    );
 
-    const timeA = Number.isFinite(dateA) ? dateA : 0;
-    const timeB = Number.isFinite(dateB) ? dateB : 0;
+    const dateB = Date.parse(
+      b.updated_at,
+    );
+
+    const timeA = Number.isFinite(dateA)
+      ? dateA
+      : 0;
+
+    const timeB = Number.isFinite(dateB)
+      ? dateB
+      : 0;
 
     return timeB - timeA;
   });
@@ -238,146 +397,277 @@ export const getAllOrthoCasesService = async (filters = {}) => {
   return cases;
 };
 
-export const getOrthoCaseByIdService = async (caseId) => {
-  const cases = (await readSheet(SHEET)) || [];
+/* ========================================================
+   3. GET ORTHO CASE BY ID
+======================================================== */
 
-  return (
-    cases.find((row) => normalize(row.ortho_case_id) === normalize(caseId)) ||
-    null
-  );
-};
-
-export const getOrthoCasesByPatientService = async (patientId) => {
-  const cases = (await readSheet(SHEET)) || [];
-
-  return cases.filter(
-    (row) => normalize(row.patient_id) === normalize(patientId),
-  );
-};
-//ortho_case_id	patient_id	dentist_id	start_date	treatment_type	treatment_area	diagnosis	estimated_duration	total_treatment_fee	payment_plan	monthly_payment	next_visit_date	status	notes	completed_date	created_at	updated_at
-export const updateOrthoCaseService = async (caseId, payload) => {
-  const cases = (await readSheet(SHEET)) || [];
-
-  const index = cases.findIndex(
-    (row) => normalize(row.ortho_case_id) === normalize(caseId),
+export const getOrthoCaseByIdService = async (
+  caseId,
+) => {
+  const record = await findCaseById(
+    caseId,
   );
 
-  if (index === -1) {
-    return null;
-  }
-
-  const protectedFields = ["ortho_case_id", "patient_id", "created_at"];
-
-  Object.entries(payload).forEach(([key, value]) => {
-    if (!protectedFields.includes(key)) {
-      cases[index][key] = value;
-    }
-  });
-
-  cases[index].updated_at = nowISO();
-
-  await writeSheet(SHEET, cases);
-
-  return cases[index];
-};
-
-export const updateOrthoCaseStatusService = async (caseId, status) => {
-  const allowed = ["Active", "On Hold", "Completed", "Cancelled"];
-
-  const matched = allowed.find((item) => normalize(item) === normalize(status));
-
-  if (!matched) {
-    throw new Error("Invalid Ortho status");
-  }
-
-  const cases = (await readSheet(SHEET)) || [];
-
-  const index = cases.findIndex(
-    (row) => normalize(row.ortho_case_id) === normalize(caseId),
-  );
-
-  if (index === -1) {
-    return null;
-  }
-
-  cases[index] = {
-    ...cases[index],
-    status: matched,
-    completed_date: matched === "Completed" ? todayISO() : "",
-    updated_at: nowISO(),
-  };
-
-  await writeSheet(SHEET, cases);
-
-  return cases[index];
+  return formatOrthoCase(record);
 };
 
 /* ========================================================
-   PERMANENTLY DELETE ORTHO CASE RECORD
+   4. GET ORTHO CASES BY PATIENT
 ======================================================== */
 
-export const deleteOrthoCaseRecordService = async (caseId) => {
-  const normalizedCaseId = normalize(caseId);
+export const getOrthoCasesByPatientService = async (
+  patientId,
+) => {
+  const records =
+    await prisma.orthoCase.findMany({
+      where: {
+        patientId: {
+          equals: clean(patientId),
+          mode: "insensitive",
+        },
+      },
+    });
 
-  /* ----------------------------------------------------
-     VALIDATE CASE ID
-  ---------------------------------------------------- */
+  return records.map(
+    formatOrthoCase,
+  );
+};
 
-  if (!normalizedCaseId) {
-    throw new Error("Ortho case ID is required");
-  }
+/* ========================================================
+   5. UPDATE ORTHO CASE
+======================================================== */
 
-  /* ----------------------------------------------------
-     READ ORTHO CASES
-  ---------------------------------------------------- */
-
-  const cases = (await readSheet(SHEET)) || [];
-
-  /* ----------------------------------------------------
-     FIND CASE
-  ---------------------------------------------------- */
-
-  const caseIndex = cases.findIndex(
-    (row) => normalize(row.ortho_case_id) === normalizedCaseId,
+export const updateOrthoCaseService = async (
+  caseId,
+  payload = {},
+) => {
+  const existing = await findCaseById(
+    caseId,
   );
 
-  if (caseIndex === -1) {
+  if (!existing) {
     return null;
   }
 
-  /* ----------------------------------------------------
-     PRESERVE CASE DETAILS
-  ---------------------------------------------------- */
+  /*
+   * Only allow fields supported by
+   * the Prisma model.
+   *
+   * Protected fields cannot be updated.
+   */
+  const fieldMap = {
+    dentist_id: "dentistId",
+    start_date: "startDate",
+    treatment_type: "treatmentType",
+    treatment_area: "treatmentArea",
+    diagnosis: "diagnosis",
+    estimated_duration: "estimatedDuration",
+    total_treatment_fee: "totalTreatmentFee",
+    payment_plan: "paymentPlan",
+    monthly_payment: "monthlyPayment",
+    next_visit_date: "nextVisitDate",
+    status: "status",
+    notes: "notes",
+    completed_date: "completedDate",
+  };
 
-  const deletedCase = { ...cases[caseIndex] };
+  const updateData = {};
 
-  /* ----------------------------------------------------
-     REMOVE CASE
-  ---------------------------------------------------- */
+  Object.entries(payload).forEach(
+    ([key, value]) => {
+      if (
+        PROTECTED_FIELDS.includes(key)
+      ) {
+        return;
+      }
 
-  const updatedCases = cases.filter(
-    (row) => normalize(row.ortho_case_id) !== normalizedCaseId,
+      const prismaField =
+        fieldMap[key];
+
+      if (!prismaField) return;
+
+      if (
+        prismaField ===
+          "totalTreatmentFee" ||
+        prismaField ===
+          "monthlyPayment"
+      ) {
+        updateData[prismaField] =
+          toNumber(value);
+      } else {
+        updateData[prismaField] =
+          clean(value);
+      }
+    },
   );
 
-  /* ----------------------------------------------------
-     UPDATE GOOGLE SHEET
-  ---------------------------------------------------- */
+  updateData.updatedAt = nowISO();
 
-  await writeSheet(SHEET, updatedCases);
+  const updated =
+    await prisma.orthoCase.update({
+      where: {
+        orthoCaseId:
+          existing.orthoCaseId,
+      },
 
-  /* ----------------------------------------------------
-     RESULT
-  ---------------------------------------------------- */
+      data: updateData,
+    });
 
-  return {
-    case_id: deletedCase.ortho_case_id,
+  return formatOrthoCase(
+    updated,
+  );
+};
 
-    patient_id: deletedCase.patient_id,
+/* ========================================================
+   6. UPDATE ORTHO CASE STATUS
+======================================================== */
 
-    dentist_id: deletedCase.dentist_id,
+export const updateOrthoCaseStatusService = async (
+  caseId,
+  status,
+) => {
+  const matched = ALLOWED_STATUSES.find(
+    (item) =>
+      normalize(item) ===
+      normalize(status),
+  );
 
-    deleted: true,
+  if (!matched) {
+    throw new Error(
+      "Invalid Ortho status",
+    );
+  }
 
-    deleted_at: nowISO(),
-  };
+  const existing = await findCaseById(
+    caseId,
+  );
+
+  if (!existing) {
+    return null;
+  }
+
+  const updated =
+    await prisma.orthoCase.update({
+      where: {
+        orthoCaseId:
+          existing.orthoCaseId,
+      },
+
+      data: {
+        status: matched,
+
+        completedDate:
+          matched === "Completed"
+            ? todayISO()
+            : "",
+
+        updatedAt: nowISO(),
+      },
+    });
+
+  return formatOrthoCase(
+    updated,
+  );
+};
+
+/* ========================================================
+   7. PERMANENTLY DELETE ORTHO CASE
+======================================================== */
+
+export const deleteOrthoCaseRecordService = async (
+  caseId,
+) => {
+  const normalizedCaseId = normalize(
+    caseId,
+  );
+
+  if (!normalizedCaseId) {
+    throw new Error(
+      "Ortho case ID is required",
+    );
+  }
+
+  return prisma.$transaction(
+    async (tx) => {
+      /*
+       * Lock the case table while checking
+       * and deleting the record.
+       */
+      await tx.$executeRaw`
+        LOCK TABLE "ortho_cases"
+        IN EXCLUSIVE MODE
+      `;
+
+      const existing = await findCaseById(
+        caseId,
+        tx,
+      );
+
+      if (!existing) {
+        return null;
+      }
+
+      /*
+       * Do not delete cases that have
+       * linked financial records.
+       */
+      const paymentCount =
+        await tx.orthoPayment.count({
+          where: {
+            orthoCaseId:
+              existing.orthoCaseId,
+          },
+        });
+
+      if (paymentCount > 0) {
+        throw createError(
+          "Cannot delete this orthodontic case because payment records exist.",
+          409,
+        );
+      }
+
+      /*
+       * Also protect existing visit records.
+       */
+      const visitCount =
+        await tx.orthoVisit.count({
+          where: {
+            orthoCaseId:
+              existing.orthoCaseId,
+          },
+        });
+
+      if (visitCount > 0) {
+        throw createError(
+          "Cannot delete this orthodontic case because visit records exist.",
+          409,
+        );
+      }
+
+      await tx.orthoCase.delete({
+        where: {
+          orthoCaseId:
+            existing.orthoCaseId,
+        },
+      });
+
+      return {
+        case_id:
+          existing.orthoCaseId,
+
+        patient_id:
+          existing.patientId,
+
+        dentist_id:
+          existing.dentistId ?? "",
+
+        deleted: true,
+
+        deleted_at: nowISO(),
+      };
+    },
+    {
+      timeout: 15000,
+    },
+  );
 };

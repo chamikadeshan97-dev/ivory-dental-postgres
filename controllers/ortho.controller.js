@@ -6,15 +6,14 @@ import {
   updateOrthoCaseService,
   updateOrthoCaseStatusService
 } from "../services/orthoCase.service.js";
-import {
-  permanentlyDeleteOrthoCaseService,
-} from "../services/orthoCaseDeletion.service.js";
+
+
 import {
   createOrthoVisitService,
   getOrthoVisitsByCaseService,
   getOrthoVisitByIdService,
   updateOrthoVisitService,
-  deleteOrthoVisitService,
+
 } from "../services/orthoVisit.service.js";
 
 import {
@@ -353,30 +352,8 @@ export const updateOrthoVisit = async (req, res) => {
   }
 };
 
-export const deleteOrthoVisit = async (req, res) => {
-  try {
-    const { visitId } = req.params;
 
-    const data = await deleteOrthoVisitService(visitId);
 
-    if (!data) {
-      return res.status(404).json({
-        success: false,
-        message: "Ortho visit not found",
-      });
-    }
-
-    return res.json({
-      success: true,
-
-      message: "Ortho visit deleted successfully",
-
-      data,
-    });
-  } catch (error) {
-    return sendServerError(res, error, "Failed to delete Ortho visit");
-  }
-};
 
 /* ========================================================
    PAYMENTS
@@ -823,56 +800,8 @@ export const permanentlyDeleteOrthoMedia = async (req, res) => {
    PERMANENTLY DELETE COMPLETE ORTHO CASE
 ======================================================== */
 
-export const deleteOrthoCasePermanently = async (req, res) => {
-  try {
-    const { caseId } = req.params;
 
-    /* ----------------------------------------------------
-       VALIDATE
-    ---------------------------------------------------- */
 
-    if (!normalize(caseId)) {
-      return res.status(400).json({
-        success: false,
-        message: "Ortho case ID is required",
-      });
-    }
-
-    /* ----------------------------------------------------
-       EXECUTE DELETION
-    ---------------------------------------------------- */
-
-    const result = await permanentlyDeleteOrthoCaseService(
-      caseId
-    );
-
-    /* ----------------------------------------------------
-       RESPONSE
-    ---------------------------------------------------- */
-
-    return res.status(200).json({
-      success: true,
-
-      message:
-        "Ortho case and all related records permanently deleted successfully",
-
-      data: result,
-    });
-  } catch (error) {
-    console.error(
-      "Permanent Ortho case deletion failed:",
-      error
-    );
-
-    return res.status(error.status || 500).json({
-      success: false,
-
-      message:
-        error.message ||
-        "Failed to permanently delete Ortho case",
-    });
-  }
-};
 export const getOrthoCaseSummary = async (req, res) => {
   try {
     const { caseId } = req.params;

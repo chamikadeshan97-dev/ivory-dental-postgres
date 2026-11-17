@@ -11,20 +11,67 @@ import {
 } from "@aws-sdk/client-s3";
 
 /* ========================================================
-   CONFIG
+   CONFIG — CLOUDFLARE R2
 ======================================================== */
 
-const REGION = process.env.AWS_REGION;
-const BUCKET = process.env.AWS_S3_BUCKET;
+const REGION = process.env.S3_REGION || "auto";
 
-if (!REGION || !BUCKET) {
+const BUCKET = process.env.S3_BUCKET_NAME;
+
+const ENDPOINT = process.env.S3_ENDPOINT;
+
+const ACCESS_KEY_ID = process.env.S3_ACCESS_KEY_ID;
+
+const SECRET_ACCESS_KEY =
+  process.env.S3_SECRET_ACCESS_KEY;
+
+if (
+  !BUCKET ||
+  !ENDPOINT ||
+  !ACCESS_KEY_ID ||
+  !SECRET_ACCESS_KEY
+) {
   throw new Error(
-    "AWS_REGION and AWS_S3_BUCKET are required",
+    "Missing Cloudflare R2 environment configuration",
+  );
+}
+
+const parsedEndpoint = new URL(ENDPOINT);
+
+if (
+  parsedEndpoint.protocol !== "https:" ||
+  !/^[a-f0-9]{32}\.r2\.cloudflarestorage\.com$/i.test(
+    parsedEndpoint.hostname,
+  ) ||
+  parsedEndpoint.pathname !== "/" ||
+  parsedEndpoint.search ||
+  parsedEndpoint.hash ||
+  parsedEndpoint.username ||
+  parsedEndpoint.password
+) {
+  throw new Error(
+    "Invalid Cloudflare R2 S3 endpoint",
+  );
+}
+
+if (REGION !== "auto") {
+  throw new Error(
+    "Cloudflare R2 requires S3_REGION=auto",
   );
 }
 
 const s3 = new S3Client({
   region: REGION,
+
+  endpoint: ENDPOINT,
+
+  credentials: {
+    accessKeyId: ACCESS_KEY_ID,
+    secretAccessKey: SECRET_ACCESS_KEY,
+  },
+
+  forcePathStyle: true,
+
   maxAttempts: 3,
 });
 
@@ -252,7 +299,6 @@ const resolveContentType = (file) => {
 
   const detected = detectFileType(file.buffer);
 
-  // HEIC and HEIF can share compatible HEIF brands.
   const heifCompatible =
     ["image/heic", "image/heif"].includes(expected) &&
     ["image/heic", "image/heif"].includes(detected);
@@ -369,7 +415,7 @@ export const uploadClinicalFileToS3 = async ({
       bucket: BUCKET,
     };
   } catch (error) {
-    console.error("S3 upload failed:", {
+    console.error("R2 upload failed:", {
       name: error.name,
       message: error.message,
     });
@@ -392,7 +438,7 @@ export const uploadMulterFileToS3 = async ({
 
   return uploadClinicalFileToS3({
     buffer: file.buffer,
-    fileName,
+    fileName: fileName || file.originalname,
     mimeType,
     patientId,
     categoryFolder,
@@ -448,7 +494,7 @@ export const getS3FileStream = async (key) => {
     typeof response.Body.pipe !== "function"
   ) {
     throw new Error(
-      "S3 did not return a readable Node.js stream",
+      "R2 did not return a readable Node.js stream",
     );
   }
 

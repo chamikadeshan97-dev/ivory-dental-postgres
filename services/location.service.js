@@ -1,15 +1,15 @@
-import {
-  readSheet,
-  writeSheet,
-} from "../utils/googleSheets.js";
 
-const SHEET_NAME = "Locations";
+import prisma from "../config/prisma.js";
 
-/*
-|--------------------------------------------------------------------------
-| Helpers
-|--------------------------------------------------------------------------
-*/
+/* ========================================================
+   GENERAL HELPERS
+======================================================== */
+
+const createError = (message, statusCode = 400) => {
+  const error = new Error(message);
+  error.statusCode = statusCode;
+  return error;
+};
 
 const normalizeText = (value) => {
   return String(value ?? "").trim();
@@ -18,19 +18,18 @@ const normalizeText = (value) => {
 const normalizeDistance = (value) => {
   const distance = Number(value);
 
-  if (
-    !Number.isFinite(distance) ||
-    distance < 0
-  ) {
+  if (!Number.isFinite(distance) || distance < 0) {
     return null;
   }
 
   return distance;
 };
 
-const generateLocationId = (
-  locations = [],
-) => {
+/* ========================================================
+   LOCATION ID GENERATOR
+======================================================== */
+
+const generateLocationId = (locations = []) => {
   const largestNumber = locations.reduce(
     (largest, location) => {
       const match = String(
@@ -41,375 +40,322 @@ const generateLocationId = (
         return largest;
       }
 
-      return Math.max(
-        largest,
-        Number(match[1]),
-      );
+      return Math.max(largest, Number(match[1]));
     },
     0,
   );
 
-  return `LOC_${String(
-    largestNumber + 1,
-  ).padStart(4, "0")}`;
+  return `LOC_${String(largestNumber + 1).padStart(4, "0")}`;
 };
+
+/* ========================================================
+   PRISMA RESPONSE MAPPER
+======================================================== */
 
 const formatLocation = (location) => {
+  if (!location) return null;
+
   return {
-    id: normalizeText(location?.id),
-    location: normalizeText(
-      location?.location,
-    ),
-    distance_km:
-      Number(location?.distance_km) || 0,
+    id: normalizeText(location.id),
+    location: normalizeText(location.location),
+    distance_km: Number(location.distanceKm) || 0,
   };
 };
 
-/*
-|--------------------------------------------------------------------------
-| Get All Locations
-|--------------------------------------------------------------------------
-*/
+/* ========================================================
+   DATABASE HELPERS
+======================================================== */
 
-export const getAllLocationsService =
-  async () => {
-    const locationRows =
-      await readSheet(SHEET_NAME);
+const getAllLocationRows = async (db = prisma) => {
+  return db.location.findMany();
+};
 
-    const locations =
-      Array.isArray(locationRows)
-        ? locationRows
-        : [];
+const findLocationById = async (id, db = prisma) => {
+  const normalizedId = normalizeText(id);
 
-    return locations
-      .map(formatLocation)
-      .filter(
-        (location) =>
-          location.id &&
-          location.location,
-      )
-      .sort(
-        (firstLocation, secondLocation) =>
-          firstLocation.distance_km -
-            secondLocation.distance_km ||
-          firstLocation.location.localeCompare(
-            secondLocation.location,
-            undefined,
-            {
-              sensitivity: "base",
-            },
-          ),
-      );
-  };
+  if (!normalizedId) return null;
 
-/*
-|--------------------------------------------------------------------------
-| Get Location by ID
-|--------------------------------------------------------------------------
-*/
-
-export const getLocationByIdService =
-  async (id) => {
-    const locationId =
-      normalizeText(id).toLowerCase();
-
-    if (!locationId) {
-      return null;
-    }
-
-    const locationRows =
-      await readSheet(SHEET_NAME);
-
-    const locations =
-      Array.isArray(locationRows)
-        ? locationRows
-        : [];
-
-    const location = locations.find(
-      (item) => {
-        return (
-          normalizeText(
-            item?.id,
-          ).toLowerCase() === locationId
-        );
+  return db.location.findFirst({
+    where: {
+      id: {
+        equals: normalizedId,
+        mode: "insensitive",
       },
+    },
+  });
+};
+
+const findDuplicateLocation = async (
+  locationName,
+  ignoredId = null,
+  db = prisma,
+) => {
+  const locations = await getAllLocationRows(db);
+
+  const normalizedName = normalizeText(
+    locationName,
+  ).toLowerCase();
+
+  const normalizedIgnoredId = ignoredId
+    ? normalizeText(ignoredId).toLowerCase()
+    : null;
+
+  return locations.find((item) => {
+    const sameName =
+      normalizeText(item.location).toLowerCase() ===
+      normalizedName;
+
+    const isIgnored =
+      normalizedIgnoredId &&
+      normalizeText(item.id).toLowerCase() ===
+        normalizedIgnoredId;
+
+    return sameName && !isIgnored;
+  });
+};
+
+/* ========================================================
+   1. GET ALL LOCATIONS
+======================================================== */
+
+export const getAllLocationsService = async () => {
+  const locations = await getAllLocationRows();
+
+  return locations
+    .map(formatLocation)
+    .filter(
+      (location) =>
+        location.id &&
+        location.location,
+    )
+    .sort(
+      (firstLocation, secondLocation) =>
+        firstLocation.distance_km -
+          secondLocation.distance_km ||
+        firstLocation.location.localeCompare(
+          secondLocation.location,
+          undefined,
+          {
+            sensitivity: "base",
+          },
+        ),
     );
+};
 
-    return location
-      ? formatLocation(location)
-      : null;
-  };
+/* ========================================================
+   2. GET LOCATION BY ID
+======================================================== */
 
-/*
-|--------------------------------------------------------------------------
-| Create Location
-|--------------------------------------------------------------------------
-*/
+export const getLocationByIdService = async (id) => {
+  const locationId = normalizeText(id);
 
-export const createLocationService =
-  async (data = {}) => {
-    const locationName =
-      normalizeText(data.location);
+  if (!locationId) {
+    return null;
+  }
 
-    const distanceKm =
-      normalizeDistance(
-        data.distance_km,
-      );
+  const location = await findLocationById(locationId);
 
-    if (!locationName) {
-      const error = new Error(
-        "Location name is required.",
-      );
+  return location ? formatLocation(location) : null;
+};
 
-      error.statusCode = 400;
+/* ========================================================
+   3. CREATE LOCATION
+======================================================== */
 
-      throw error;
-    }
+export const createLocationService = async (data = {}) => {
+  const locationName = normalizeText(data.location);
 
-    if (distanceKm === null) {
-      const error = new Error(
-        "Distance must be a valid number greater than or equal to 0.",
-      );
+  const distanceKm = normalizeDistance(
+    data.distance_km,
+  );
 
-      error.statusCode = 400;
-
-      throw error;
-    }
-
-    const locationRows =
-      await readSheet(SHEET_NAME);
-
-    const locations =
-      Array.isArray(locationRows)
-        ? locationRows.map(formatLocation)
-        : [];
-
-    const normalizedLocationName =
-      locationName.toLowerCase();
-
-    const locationAlreadyExists =
-      locations.some((item) => {
-        return (
-          normalizeText(
-            item.location,
-          ).toLowerCase() ===
-          normalizedLocationName
-        );
-      });
-
-    if (locationAlreadyExists) {
-      const error = new Error(
-        "A location with this name already exists.",
-      );
-
-      error.statusCode = 409;
-
-      throw error;
-    }
-
-    const newLocation = {
-      id: generateLocationId(locations),
-      location: locationName,
-      distance_km: distanceKm,
-    };
-
-    locations.push(newLocation);
-
-    await writeSheet(
-      SHEET_NAME,
-      locations,
+  if (!locationName) {
+    throw createError(
+      "Location name is required.",
+      400,
     );
+  }
 
-    return newLocation;
-  };
+  if (distanceKm === null) {
+    throw createError(
+      "Distance must be a valid number greater than or equal to 0.",
+      400,
+    );
+  }
 
-/*
-|--------------------------------------------------------------------------
-| Update Location
-|--------------------------------------------------------------------------
-*/
+  return prisma.$transaction(
+    async (tx) => {
+      /*
+       * Prevent two concurrent requests from
+       * generating the same LOC ID.
+       */
+      await tx.$executeRaw`
+        LOCK TABLE "locations" IN EXCLUSIVE MODE
+      `;
 
-export const updateLocationService =
-  async (
-    id,
-    data = {},
-  ) => {
-    const locationId =
-      normalizeText(id).toLowerCase();
-
-    const locationName =
-      normalizeText(data.location);
-
-    const distanceKm =
-      normalizeDistance(
-        data.distance_km,
+      const duplicate = await findDuplicateLocation(
+        locationName,
+        null,
+        tx,
       );
 
-    if (!locationId) {
-      const error = new Error(
-        "Location ID is required.",
-      );
-
-      error.statusCode = 400;
-
-      throw error;
-    }
-
-    if (!locationName) {
-      const error = new Error(
-        "Location name is required.",
-      );
-
-      error.statusCode = 400;
-
-      throw error;
-    }
-
-    if (distanceKm === null) {
-      const error = new Error(
-        "Distance must be a valid number greater than or equal to 0.",
-      );
-
-      error.statusCode = 400;
-
-      throw error;
-    }
-
-    const locationRows =
-      await readSheet(SHEET_NAME);
-
-    const locations =
-      Array.isArray(locationRows)
-        ? locationRows.map(formatLocation)
-        : [];
-
-    const locationIndex =
-      locations.findIndex((item) => {
-        return (
-          normalizeText(
-            item.id,
-          ).toLowerCase() === locationId
+      if (duplicate) {
+        throw createError(
+          "A location with this name already exists.",
+          409,
         );
-      });
+      }
 
-    if (locationIndex === -1) {
-      const error = new Error(
-        "Location not found.",
-      );
+      const existingLocations =
+        await getAllLocationRows(tx);
 
-      error.statusCode = 404;
+      const newLocation = await tx.location.create({
+        data: {
+          id: generateLocationId(existingLocations),
 
-      throw error;
-    }
+          location: locationName,
 
-    const normalizedLocationName =
-      locationName.toLowerCase();
-
-    const duplicateLocation =
-      locations.some(
-        (item, index) => {
-          if (index === locationIndex) {
-            return false;
-          }
-
-          return (
-            normalizeText(
-              item.location,
-            ).toLowerCase() ===
-            normalizedLocationName
-          );
+          // Prisma model stores distance as String.
+          distanceKm: String(distanceKm),
         },
-      );
-
-    if (duplicateLocation) {
-      const error = new Error(
-        "A location with this name already exists.",
-      );
-
-      error.statusCode = 409;
-
-      throw error;
-    }
-
-    const updatedLocation = {
-      id: normalizeText(
-        locations[locationIndex].id,
-      ),
-      location: locationName,
-      distance_km: distanceKm,
-    };
-
-    locations[locationIndex] =
-      updatedLocation;
-
-    await writeSheet(
-      SHEET_NAME,
-      locations,
-    );
-
-    return updatedLocation;
-  };
-
-/*
-|--------------------------------------------------------------------------
-| Delete Location
-|--------------------------------------------------------------------------
-*/
-
-export const deleteLocationService =
-  async (id) => {
-    const locationId =
-      normalizeText(id).toLowerCase();
-
-    if (!locationId) {
-      const error = new Error(
-        "Location ID is required.",
-      );
-
-      error.statusCode = 400;
-
-      throw error;
-    }
-
-    const locationRows =
-      await readSheet(SHEET_NAME);
-
-    const locations =
-      Array.isArray(locationRows)
-        ? locationRows.map(formatLocation)
-        : [];
-
-    const locationIndex =
-      locations.findIndex((item) => {
-        return (
-          normalizeText(
-            item.id,
-          ).toLowerCase() === locationId
-        );
       });
 
-    if (locationIndex === -1) {
-      const error = new Error(
-        "Location not found.",
+      return formatLocation(newLocation);
+    },
+    {
+      timeout: 15000,
+    },
+  );
+};
+
+/* ========================================================
+   4. UPDATE LOCATION
+======================================================== */
+
+export const updateLocationService = async (
+  id,
+  data = {},
+) => {
+  const locationId = normalizeText(id);
+
+  const locationName = normalizeText(data.location);
+
+  const distanceKm = normalizeDistance(
+    data.distance_km,
+  );
+
+  if (!locationId) {
+    throw createError(
+      "Location ID is required.",
+      400,
+    );
+  }
+
+  if (!locationName) {
+    throw createError(
+      "Location name is required.",
+      400,
+    );
+  }
+
+  if (distanceKm === null) {
+    throw createError(
+      "Distance must be a valid number greater than or equal to 0.",
+      400,
+    );
+  }
+
+  return prisma.$transaction(
+    async (tx) => {
+      await tx.$executeRaw`
+        LOCK TABLE "locations" IN EXCLUSIVE MODE
+      `;
+
+      const existing = await findLocationById(
+        locationId,
+        tx,
       );
 
-      error.statusCode = 404;
+      if (!existing) {
+        throw createError(
+          "Location not found.",
+          404,
+        );
+      }
 
-      throw error;
-    }
-
-    const [deletedLocation] =
-      locations.splice(
-        locationIndex,
-        1,
+      const duplicate = await findDuplicateLocation(
+        locationName,
+        existing.id,
+        tx,
       );
 
-    await writeSheet(
-      SHEET_NAME,
-      locations,
-    );
+      if (duplicate) {
+        throw createError(
+          "A location with this name already exists.",
+          409,
+        );
+      }
 
-    return formatLocation(
-      deletedLocation,
+      const updated = await tx.location.update({
+        where: {
+          id: existing.id,
+        },
+        data: {
+          location: locationName,
+          distanceKm: String(distanceKm),
+        },
+      });
+
+      return formatLocation(updated);
+    },
+    {
+      timeout: 15000,
+    },
+  );
+};
+
+/* ========================================================
+   5. DELETE LOCATION
+======================================================== */
+
+export const deleteLocationService = async (id) => {
+  const locationId = normalizeText(id);
+
+  if (!locationId) {
+    throw createError(
+      "Location ID is required.",
+      400,
     );
-  };
+  }
+
+  return prisma.$transaction(
+    async (tx) => {
+      await tx.$executeRaw`
+        LOCK TABLE "locations" IN EXCLUSIVE MODE
+      `;
+
+      const existing = await findLocationById(
+        locationId,
+        tx,
+      );
+
+      if (!existing) {
+        throw createError(
+          "Location not found.",
+          404,
+        );
+      }
+
+      const deleted = await tx.location.delete({
+        where: {
+          id: existing.id,
+        },
+      });
+
+      return formatLocation(deleted);
+    },
+    {
+      timeout: 15000,
+    },
+  );
+};

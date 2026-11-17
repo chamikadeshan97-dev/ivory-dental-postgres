@@ -1,4 +1,3 @@
-// Initial development schema. Add remaining models only after validating source columns and relationships.
 generator client {
   provider = "prisma-client-js"
 }
@@ -8,19 +7,315 @@ datasource db {
   url      = env("DATABASE_URL")
 }
 
+// ============================================
+// PATIENTS
+// ============================================
+
 model Patient {
-  id         String  @id
-  name       String?
-  phone      String?
-  age        String?
-  gender     String?
-  address    String?
+  id          String  @id
+  name        String?
+  phone       String?
+  age         String?
+  gender      String?
+  address     String?
   isAllergies String? @map("is_allergies")
-  allergies  String?
-  location   String?
-  distance   String?
-  createdAt  String? @map("created_at")
-  updatedAt  String? @map("updated_at")
+  allergies   String?
+  location    String?
+  distance    String?
+  createdAt   String? @map("created_at")
+  updatedAt   String? @map("updated_at")
 
   @@map("patients")
+}
+
+// ============================================
+// DENTISTS
+// ============================================
+
+model Dentist {
+  id             String  @id
+  name           String?
+  phone          String?
+  specialization String?
+  createdAt      String? @map("created_at")
+  updatedAt      String? @map("updated_at")
+
+  @@map("dentists")
+}
+
+// ============================================
+// APPOINTMENTS
+// ============================================
+
+model Appointment {
+  id                   String  @id
+  patientId            String? @map("patient_id")
+  dentistId            String? @map("dentist_id")
+  appointmentNumber    String? @map("appointment_number")
+  appointmentDate      String? @map("appointment_date")
+  appointmentTime      String? @map("appointment_time")
+  reasonForVisit       String? @map("reason_for_visit")
+  status               String?
+  checkedInTime        String? @map("checked_in_time")
+  treatmentStartedAt   String? @map("treatment_started_at")
+  treatmentCompletedAt String? @map("treatment_completed_at")
+  completedAt          String? @map("completed_at")
+  createdAt            String? @map("created_at")
+  updatedAt            String? @map("updated_at")
+
+  @@index([patientId])
+  @@index([dentistId])
+  @@index([appointmentDate])
+  @@map("appointments")
+}
+
+
+model TreatmentPayment {
+  id            String  @id
+  appointmentId String? @map("appointment_id")
+  treatmentId   String? @map("treatment_id")
+  patientId     String  @map("patient_id")
+  treatmentName String  @map("treatment_name")
+
+  totalFee    Decimal @map("total_fee") @db.Decimal(12, 2)
+  paymentType String  @map("payment_type")
+  totalPaid   Decimal @map("total_paid") @db.Decimal(12, 2)
+  balance     Decimal @db.Decimal(12, 2)
+
+  paymentHistory Json @map("payment_history") @db.JsonB
+
+  status    String
+  createdAt String? @map("created_at")
+  updatedAt String? @map("updated_at")
+
+  @@unique([appointmentId])
+  @@index([patientId])
+  @@index([treatmentId])
+  @@index([status])
+  @@map("treatment_payments")
+}
+
+// ============================================
+// ORTHODONTIC CASES
+// Source: Ortho_Cases Google Sheet
+// ============================================
+
+model OrthoCase {
+  orthoCaseId String  @id @map("ortho_case_id")
+  patientId   String  @map("patient_id")
+  dentistId   String? @map("dentist_id")
+
+  startDate         String? @map("start_date")
+  treatmentType     String? @map("treatment_type")
+  treatmentArea     String? @map("treatment_area")
+  diagnosis         String?
+  estimatedDuration String? @map("estimated_duration")
+
+  totalTreatmentFee Decimal? @map("total_treatment_fee") @db.Decimal(12, 2)
+  paymentPlan       String?  @map("payment_plan")
+  monthlyPayment    Decimal? @map("monthly_payment") @db.Decimal(12, 2)
+
+  nextVisitDate String? @map("next_visit_date")
+  status        String?
+  notes         String?
+  completedDate String? @map("completed_date")
+
+  createdAt String? @map("created_at")
+  updatedAt String? @map("updated_at")
+
+  @@index([patientId])
+  @@index([dentistId])
+  @@index([status])
+  @@index([nextVisitDate])
+  @@map("ortho_cases")
+}
+
+model OrthoVisit {
+  orthoVisitId  String  @id @map("ortho_visit_id")
+  orthoCaseId   String  @map("ortho_case_id")
+  patientId     String  @map("patient_id")
+  appointmentId String? @map("appointment_id")
+  dentistId     String? @map("dentist_id")
+
+  visitNumber      Int?    @map("visit_number")
+  visitDate        String? @map("visit_date")
+  procedure        String?
+  clinicalNotes    String? @map("clinical_notes")
+  applianceChanges String? @map("appliance_changes")
+  elastics         String?
+
+  nextVisitDate String? @map("next_visit_date")
+  nextVisitPlan String? @map("next_visit_plan")
+
+  createdAt String? @map("created_at")
+  updatedAt String? @map("updated_at")
+
+  @@index([orthoCaseId])
+  @@index([patientId])
+  @@index([appointmentId])
+  @@index([dentistId])
+  @@index([visitDate])
+  @@map("ortho_visits")
+}
+
+model OrthoPayment {
+  orthoPaymentId String  @id @map("ortho_payment_id")
+  orthoCaseId    String  @map("ortho_case_id")
+  orthoVisitId   String? @map("ortho_visit_id")
+  patientId      String  @map("patient_id")
+
+  paymentDate   String?  @map("payment_date")
+  amount        Decimal? @db.Decimal(12, 2)
+  paymentMethod String?  @map("payment_method")
+  paymentType   String?  @map("payment_type")
+
+  receiptNo  String? @map("receipt_no")
+  notes      String?
+  recordedBy String? @map("recorded_by")
+
+  createdAt String? @map("created_at")
+  updatedAt String? @map("updated_at")
+
+  @@index([orthoCaseId])
+  @@index([orthoVisitId])
+  @@index([patientId])
+  @@index([paymentDate])
+  @@map("ortho_payments")
+}
+
+model OrthoMedia {
+  orthoMediaId String  @id @map("ortho_media_id")
+  orthoCaseId  String  @map("ortho_case_id")
+  patientId    String  @map("patient_id")
+  orthoVisitId String? @map("ortho_visit_id")
+
+  mediaDate   String? @map("media_date")
+  mediaType   String? @map("media_type")
+  category    String?
+  stage       String?
+  description String?
+
+  driveFileId   String? @map("drive_file_id")
+  driveFolderId String? @map("drive_folder_id")
+  fileName      String? @map("file_name")
+  mimeType      String? @map("mime_type")
+  fileSize      String? @map("file_size")
+
+  uploadedBy String? @map("uploaded_by")
+  uploadedAt String? @map("uploaded_at")
+  isDeleted  String? @map("is_deleted")
+
+  storageProvider String? @map("storage_provider")
+  s3Bucket        String? @map("s3_bucket")
+  s3Key           String? @map("s3_key")
+  deletedAt       String? @map("deleted_at")
+
+  @@index([orthoCaseId])
+  @@index([patientId])
+  @@index([orthoVisitId])
+  @@index([storageProvider])
+  @@index([isDeleted])
+  @@map("ortho_media")
+}
+
+// ============================================
+// QUEUE ORDER
+// Source: QueueOrder Google Sheet
+// ============================================
+
+model QueueOrder {
+  date       String  @id
+  queueOrder Json    @map("queue_order") @db.JsonB
+  updatedAt  String? @map("updated_at")
+
+  @@map("queue_order")
+}
+
+model Location {
+  id         String  @id
+  location   String?
+  distanceKm String? @map("distance_km")
+
+  @@map("locations")
+}
+
+model User {
+  id           String  @id
+  name         String?
+  username     String?
+  passwordHash String? @map("password_hash")
+  role         String?
+  status       String?
+  createdAt    String? @map("created_at")
+  updatedAt    String? @map("updated_at")
+
+  email    String?
+  password String?
+  phone    String?
+
+  appointmentHistory String? @map("appointment_history")
+  queueManager       String? @map("queue_manager")
+  doctorTreatment    String? @map("doctor_treatment")
+  paymentHistory     String? @map("payment_history")
+  commonTreatments   String? @map("common_treatments")
+  drugs              String?
+  locations          String?
+
+  @@index([username])
+  @@index([role])
+  @@index([status])
+  @@map("users")
+}
+
+model CommonTreatment {
+  id            String   @id
+  treatmentName String?  @map("treatment_name")
+  fee           Decimal? @db.Decimal(12, 2)
+  createdAt     String?  @map("created_at")
+  updatedAt     String?  @map("updated_at")
+
+  @@index([treatmentName])
+  @@map("common_treatments")
+}
+
+model SmsLog {
+  id Int @id @default(autoincrement())
+
+  date    String? @map("Date")
+  smsType String? @map("SMS Type")
+  status  String? @map("Status")
+
+  total Int? @map("Total")
+  sent  Int? @map("Sent")
+  fail  Int? @map("Fail")
+
+  sentBy     String? @map("Sent By")
+  sentAt     String? @map("Sent At")
+  failed     String? @map("Failed")
+  batchToken String? @map("Batch Token")
+
+  @@index([date])
+  @@index([status])
+  @@index([batchToken])
+  @@map("sms_logs")
+}
+
+model DisplayMusic {
+  id String @id @default("main")
+
+  musicYoutubeUrl String  @default("") @map("music_youtube_url")
+  musicVideoId    String  @default("") @map("music_video_id")
+  musicPlaying    Boolean @default(false) @map("music_playing")
+  musicVolume     Int     @default(20) @map("music_volume")
+
+  videoYoutubeUrl String  @default("") @map("video_youtube_url")
+  videoVideoId    String  @default("") @map("video_video_id")
+  videoPlaying    Boolean @default(false) @map("video_playing")
+  videoVolume     Int     @default(50) @map("video_volume")
+
+  displayMode String @default("queue") @map("display_mode")
+
+  updatedAt String? @map("updated_at")
+
+  @@map("display_music")
 }

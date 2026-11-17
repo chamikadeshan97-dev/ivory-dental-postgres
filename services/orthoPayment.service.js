@@ -1,16 +1,18 @@
-import {
-  readSheet,
-  writeSheet,
-} from "../utils/googleSheets.js";
 
-const PAYMENTS_SHEET = "Ortho_Payments";
-const CASES_SHEET = "Ortho_Cases";
+import prisma from "../config/prisma.js";
 
-const clean = (value) => String(value ?? "").trim();
+/* ========================================================
+   HELPERS
+======================================================== */
+
+const clean = (value) =>
+  String(value ?? "").trim();
+
 const normalize = (value) =>
   clean(value).toLowerCase();
 
-const nowISO = () => new Date().toISOString();
+const nowISO = () =>
+  new Date().toISOString();
 
 const todayISO = () =>
   new Date().toISOString().split("T")[0];
@@ -20,294 +22,426 @@ const toNumber = (value) => {
   return Number.isFinite(number) ? number : 0;
 };
 
-const generateNextId = (
-  rows,
-  fieldName,
-  prefix
-) => {
+const createError = (message, status = 400) => {
+  const error = new Error(message);
+  error.status = status;
+  error.statusCode = status;
+  return error;
+};
+
+/* ========================================================
+   GENERATE NEXT PAYMENT ID
+======================================================== */
+
+const generateNextId = (rows) => {
   let max = 0;
 
   rows.forEach((row) => {
-    const id = clean(row?.[fieldName]);
+    const id = clean(row.orthoPaymentId);
 
-    if (!id.startsWith(`${prefix}_`)) {
-      return;
-    }
+    const match = id.match(/^ORP_(\d+)$/i);
 
-    const number = Number(
-      id.replace(`${prefix}_`, "")
-    );
+    if (!match) return;
+
+    const number = Number(match[1]);
 
     if (Number.isFinite(number) && number > max) {
       max = number;
     }
   });
 
-  return `${prefix}_${String(max + 1).padStart(
-    4,
-    "0"
-  )}`;
+  return `ORP_${String(max + 1).padStart(4, "0")}`;
 };
 
-export const createOrthoPaymentService =
-  async (caseId, payload) => {
-    const amount = toNumber(payload.amount);
-
-    if (amount <= 0) {
-      throw new Error(
-        "Payment amount must be greater than 0"
-      );
-    }
-
-    const cases =
-      (await readSheet(CASES_SHEET)) || [];
-
-    const orthoCase = cases.find(
-      (row) =>
-        normalize(row.ortho_case_id) ===
-        normalize(caseId)
-    );
-
-    if (!orthoCase) {
-      throw new Error("Ortho case not found");
-    }
-
-    const payments =
-      (await readSheet(PAYMENTS_SHEET)) || [];
-
-    const paymentId = generateNextId(
-      payments,
-      "ortho_payment_id",
-      "ORP"
-    );
-
-    const record = {
-      ortho_payment_id: paymentId,
-      ortho_case_id: caseId,
-
-      ortho_visit_id: clean(
-        payload.ortho_visit_id
-      ),
-
-      patient_id: orthoCase.patient_id,
-
-      payment_date:
-        clean(payload.payment_date) || todayISO(),
-
-      amount,
-
-      payment_method: clean(
-        payload.payment_method
-      ),
-
-      payment_type: clean(payload.payment_type),
-
-      receipt_no:
-        clean(payload.receipt_no) ||
-        `ORT-RCP-${paymentId.replace(
-          "ORP_",
-          ""
-        )}`,
-
-      notes: clean(payload.notes),
-
-      recorded_by: clean(payload.recorded_by),
-
-      created_at: nowISO(),
-      updated_at: nowISO(),
-    };
-
-    payments.push(record);
-
-    await writeSheet(PAYMENTS_SHEET, payments);
-
-    return record;
-  };
-
-export const getOrthoPaymentsByCaseService =
-  async (caseId) => {
-    const payments =
-      (await readSheet(PAYMENTS_SHEET)) || [];
-
-    const results = payments.filter(
-      (row) =>
-        normalize(row.ortho_case_id) ===
-        normalize(caseId)
-    );
-
-    const totalPaid = results.reduce(
-      (sum, row) => sum + toNumber(row.amount),
-      0
-    );
-
-    return {
-      payments: results,
-      totalPaid,
-    };
-  };
-
-export const getOrthoPaymentByIdService =
-  async (paymentId) => {
-    const payments =
-      (await readSheet(PAYMENTS_SHEET)) || [];
-
-    return (
-      payments.find(
-        (row) =>
-          normalize(row.ortho_payment_id) ===
-          normalize(paymentId)
-      ) || null
-    );
-  };
-
-export const updateOrthoPaymentService =
-  async (paymentId, payload) => {
-    const payments =
-      (await readSheet(PAYMENTS_SHEET)) || [];
-
-    const index = payments.findIndex(
-      (row) =>
-        normalize(row.ortho_payment_id) ===
-        normalize(paymentId)
-    );
-
-    if (index === -1) {
-      return null;
-    }
-
-    const protectedFields = [
-      "ortho_payment_id",
-      "ortho_case_id",
-      "patient_id",
-      "created_at",
-    ];
-
-    Object.entries(payload).forEach(
-      ([key, value]) => {
-        if (!protectedFields.includes(key)) {
-          payments[index][key] =
-            key === "amount"
-              ? toNumber(value)
-              : value;
-        }
-      }
-    );
-
-    if (toNumber(payments[index].amount) <= 0) {
-      throw new Error(
-        "Payment amount must be greater than 0"
-      );
-    }
-
-    payments[index].updated_at = nowISO();
-
-    await writeSheet(PAYMENTS_SHEET, payments);
-
-    return payments[index];
-  };
-
-export const deleteOrthoPaymentService =
-  async (paymentId) => {
-    const payments =
-      (await readSheet(PAYMENTS_SHEET)) || [];
-
-    const index = payments.findIndex(
-      (row) =>
-        normalize(row.ortho_payment_id) ===
-        normalize(paymentId)
-    );
-
-    if (index === -1) {
-      return null;
-    }
-
-    const [deleted] = payments.splice(index, 1);
-
-    await writeSheet(PAYMENTS_SHEET, payments);
-
-    return deleted;
-  };
-
-  /* ========================================================
-   PERMANENTLY DELETE ALL PAYMENTS BY ORTHO CASE
+/* ========================================================
+   FORMAT PAYMENT RESPONSE
 ======================================================== */
 
-export const deleteOrthoPaymentsByCaseService = async (caseId) => {
-  /* ----------------------------------------------------
-     VALIDATE CASE ID
-  ---------------------------------------------------- */
-
-  const normalizedCaseId = normalize(caseId);
-
-  if (!normalizedCaseId) {
-    throw new Error("Ortho case ID is required");
-  }
-
-  /* ----------------------------------------------------
-     READ ALL PAYMENTS
-  ---------------------------------------------------- */
-
-  const payments = (await readSheet(PAYMENTS_SHEET)) || [];
-
-  /* ----------------------------------------------------
-     FIND RELATED PAYMENTS
-  ---------------------------------------------------- */
-
-  const relatedPayments = payments.filter(
-    (row) =>
-      normalize(row.ortho_case_id) === normalizedCaseId
-  );
-
-  /* ----------------------------------------------------
-     NO PAYMENTS FOUND
-  ---------------------------------------------------- */
-
-  if (relatedPayments.length === 0) {
-    return {
-      case_id: caseId,
-      deleted_count: 0,
-      deleted_payment_ids: [],
-      deleted_total_amount: 0,
-    };
-  }
-
-  /* ----------------------------------------------------
-     CALCULATE DELETED AMOUNT
-  ---------------------------------------------------- */
-
-  const deletedTotalAmount = relatedPayments.reduce(
-    (sum, row) => sum + toNumber(row.amount),
-    0
-  );
-
-  /* ----------------------------------------------------
-     REMOVE RELATED PAYMENTS
-  ---------------------------------------------------- */
-
-  const remainingPayments = payments.filter(
-    (row) =>
-      normalize(row.ortho_case_id) !== normalizedCaseId
-  );
-
-  /* ----------------------------------------------------
-     UPDATE GOOGLE SHEET
-  ---------------------------------------------------- */
-
-  await writeSheet(PAYMENTS_SHEET, remainingPayments);
-
-  /* ----------------------------------------------------
-     RETURN RESULT
-  ---------------------------------------------------- */
+const formatOrthoPayment = (record) => {
+  if (!record) return null;
 
   return {
-    case_id: caseId,
+    ortho_payment_id: record.orthoPaymentId,
+    ortho_case_id: record.orthoCaseId,
+    ortho_visit_id: record.orthoVisitId ?? "",
+    patient_id: record.patientId,
 
-    deleted_count: relatedPayments.length,
+    payment_date: record.paymentDate ?? "",
+    amount: toNumber(record.amount),
 
-    deleted_payment_ids: relatedPayments.map(
-      (row) => row.ortho_payment_id
-    ),
+    payment_method: record.paymentMethod ?? "",
+    payment_type: record.paymentType ?? "",
 
-    deleted_total_amount: deletedTotalAmount,
+    receipt_no: record.receiptNo ?? "",
+    notes: record.notes ?? "",
+    recorded_by: record.recordedBy ?? "",
+
+    created_at: record.createdAt ?? "",
+    updated_at: record.updatedAt ?? "",
   };
+};
+
+/* ========================================================
+   FIND PAYMENT BY ID
+======================================================== */
+
+const findPaymentById = async (
+  paymentId,
+  db = prisma,
+) => {
+  return db.orthoPayment.findFirst({
+    where: {
+      orthoPaymentId: {
+        equals: clean(paymentId),
+        mode: "insensitive",
+      },
+    },
+  });
+};
+
+/* ========================================================
+   1. CREATE ORTHO PAYMENT
+======================================================== */
+
+export const createOrthoPaymentService = async (
+  caseId,
+  payload = {},
+) => {
+  const amount = toNumber(payload.amount);
+
+  if (amount <= 0) {
+    throw new Error(
+      "Payment amount must be greater than 0",
+    );
+  }
+
+  return prisma.$transaction(
+    async (tx) => {
+      /*
+       * Serialize payment ID generation.
+       */
+      await tx.$executeRaw`
+        LOCK TABLE "ortho_payments"
+        IN EXCLUSIVE MODE
+      `;
+
+      const orthoCase =
+        await tx.orthoCase.findFirst({
+          where: {
+            orthoCaseId: {
+              equals: clean(caseId),
+              mode: "insensitive",
+            },
+          },
+        });
+
+      if (!orthoCase) {
+        throw new Error("Ortho case not found");
+      }
+
+      const existingPayments =
+        await tx.orthoPayment.findMany({
+          select: {
+            orthoPaymentId: true,
+          },
+        });
+
+      const paymentId =
+        generateNextId(existingPayments);
+
+      const timestamp = nowISO();
+
+      const record =
+        await tx.orthoPayment.create({
+          data: {
+            orthoPaymentId: paymentId,
+
+            orthoCaseId:
+              orthoCase.orthoCaseId,
+
+            orthoVisitId: clean(
+              payload.ortho_visit_id,
+            ),
+
+            patientId:
+              orthoCase.patientId,
+
+            paymentDate:
+              clean(payload.payment_date) ||
+              todayISO(),
+
+            amount,
+
+            paymentMethod: clean(
+              payload.payment_method,
+            ),
+
+            paymentType: clean(
+              payload.payment_type,
+            ),
+
+            receiptNo:
+              clean(payload.receipt_no) ||
+              `ORT-RCP-${paymentId.replace(
+                "ORP_",
+                "",
+              )}`,
+
+            notes: clean(
+              payload.notes,
+            ),
+
+            recordedBy: clean(
+              payload.recorded_by,
+            ),
+
+            createdAt: timestamp,
+            updatedAt: timestamp,
+          },
+        });
+
+      return formatOrthoPayment(record);
+    },
+    {
+      timeout: 15000,
+    },
+  );
+};
+
+/* ========================================================
+   2. GET PAYMENTS BY ORTHO CASE
+======================================================== */
+
+export const getOrthoPaymentsByCaseService = async (
+  caseId,
+) => {
+  const payments =
+    await prisma.orthoPayment.findMany({
+      where: {
+        orthoCaseId: {
+          equals: clean(caseId),
+          mode: "insensitive",
+        },
+      },
+    });
+
+  const results = payments.map(
+    formatOrthoPayment,
+  );
+
+  const totalPaid = results.reduce(
+    (sum, row) =>
+      sum + toNumber(row.amount),
+    0,
+  );
+
+  return {
+    payments: results,
+    totalPaid,
+  };
+};
+
+/* ========================================================
+   3. GET ORTHO PAYMENT BY ID
+======================================================== */
+
+export const getOrthoPaymentByIdService = async (
+  paymentId,
+) => {
+  const record = await findPaymentById(
+    paymentId,
+  );
+
+  return formatOrthoPayment(record);
+};
+
+/* ========================================================
+   4. UPDATE ORTHO PAYMENT
+======================================================== */
+
+export const updateOrthoPaymentService = async (
+  paymentId,
+  payload = {},
+) => {
+  const existing = await findPaymentById(
+    paymentId,
+  );
+
+  if (!existing) {
+    return null;
+  }
+
+  /*
+   * Protected fields:
+   * - ortho_payment_id
+   * - ortho_case_id
+   * - patient_id
+   * - created_at
+   */
+  const fieldMap = {
+    ortho_visit_id: "orthoVisitId",
+    payment_date: "paymentDate",
+    amount: "amount",
+    payment_method: "paymentMethod",
+    payment_type: "paymentType",
+    receipt_no: "receiptNo",
+    notes: "notes",
+    recorded_by: "recordedBy",
+  };
+
+  const updateData = {};
+
+  Object.entries(payload).forEach(
+    ([key, value]) => {
+      const prismaField =
+        fieldMap[key];
+
+      if (!prismaField) return;
+
+      updateData[prismaField] =
+        prismaField === "amount"
+          ? toNumber(value)
+          : clean(value);
+    },
+  );
+
+  const finalAmount =
+    updateData.amount !== undefined
+      ? updateData.amount
+      : toNumber(existing.amount);
+
+  if (finalAmount <= 0) {
+    throw new Error(
+      "Payment amount must be greater than 0",
+    );
+  }
+
+  updateData.updatedAt = nowISO();
+
+  const updated =
+    await prisma.orthoPayment.update({
+      where: {
+        orthoPaymentId:
+          existing.orthoPaymentId,
+      },
+
+      data: updateData,
+    });
+
+  return formatOrthoPayment(updated);
+};
+
+/* ========================================================
+   5. DELETE ORTHO PAYMENT
+======================================================== */
+
+export const deleteOrthoPaymentService = async (
+  paymentId,
+) => {
+  const existing = await findPaymentById(
+    paymentId,
+  );
+
+  if (!existing) {
+    return null;
+  }
+
+  const deleted =
+    await prisma.orthoPayment.delete({
+      where: {
+        orthoPaymentId:
+          existing.orthoPaymentId,
+      },
+    });
+
+  return formatOrthoPayment(deleted);
+};
+
+/* ========================================================
+   6. DELETE ALL PAYMENTS BY ORTHO CASE
+======================================================== */
+
+export const deleteOrthoPaymentsByCaseService = async (
+  caseId,
+) => {
+  const normalizedCaseId = normalize(
+    caseId,
+  );
+
+  if (!normalizedCaseId) {
+    throw new Error(
+      "Ortho case ID is required",
+    );
+  }
+
+  return prisma.$transaction(
+    async (tx) => {
+      /*
+       * Prevent concurrent payment writes
+       * during bulk deletion.
+       */
+      await tx.$executeRaw`
+        LOCK TABLE "ortho_payments"
+        IN EXCLUSIVE MODE
+      `;
+
+      const relatedPayments =
+        await tx.orthoPayment.findMany({
+          where: {
+            orthoCaseId: {
+              equals: clean(caseId),
+              mode: "insensitive",
+            },
+          },
+        });
+
+      if (!relatedPayments.length) {
+        return {
+          case_id: caseId,
+          deleted_count: 0,
+          deleted_payment_ids: [],
+          deleted_total_amount: 0,
+        };
+      }
+
+      const deletedTotalAmount =
+        relatedPayments.reduce(
+          (sum, payment) =>
+            sum + toNumber(
+              payment.amount,
+            ),
+          0,
+        );
+
+      await tx.orthoPayment.deleteMany({
+        where: {
+          orthoPaymentId: {
+            in: relatedPayments.map(
+              (payment) =>
+                payment.orthoPaymentId,
+            ),
+          },
+        },
+      });
+
+      return {
+        case_id: caseId,
+
+        deleted_count:
+          relatedPayments.length,
+
+        deleted_payment_ids:
+          relatedPayments.map(
+            (payment) =>
+              payment.orthoPaymentId,
+          ),
+
+        deleted_total_amount:
+          deletedTotalAmount,
+      };
+    },
+    {
+      timeout: 15000,
+    },
+  );
 };

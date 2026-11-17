@@ -1,34 +1,25 @@
 
 /* ============================================================
    IVORY DENTAL - DAILY SMS LOG SERVICE
-   Google Sheets Storage
+   PostgreSQL + Prisma
 ============================================================ */
 
-import {
-  readSheet,
-  writeSheet,
-} from "../utils/googleSheets.js";
+import { randomUUID } from "node:crypto";
+
+import prisma from "../config/prisma.js";
 
 /* ============================================================
    CONFIG
 ============================================================ */
 
-const SHEET_NAME = "SMSLogs";
-
-export const SMS_TYPES = {
+export const SMS_TYPES = Object.freeze({
   DOCTOR_ARRIVAL: "DOCTOR_ARRIVAL",
   APPOINTMENT: "APPOINTMENT",
-};
+});
 
 const VALID_TYPES = Object.values(SMS_TYPES);
 
 const TIME_ZONE = "Asia/Colombo";
-
-/*
-  Required sheet headers:
-  Date | SMS Type | Status | Total | Sent |
-  Failed | Sent By | Sent At | Batch Token
-*/
 
 /* ============================================================
    HELPERS
@@ -61,29 +52,27 @@ const getTimestamp = () => {
   }).format(new Date());
 };
 
+const createError = (message, statusCode = 400) => {
+  const error = new Error(message);
+
+  error.statusCode = statusCode;
+  error.status = statusCode;
+
+  return error;
+};
+
 const validateType = (smsType) => {
   if (!VALID_TYPES.includes(smsType)) {
-    const error = new Error("Invalid SMS type");
-    error.statusCode = 400;
-    throw error;
+    throw createError("Invalid SMS type", 400);
   }
 };
 
-const readLogs = async () => {
-  return readSheet(SHEET_NAME, {
-    forceRefresh: true,
-  });
-};
+const toNumber = (value) =>
+  Number(value) || 0;
 
-const findTodayRecord = (records, smsType, date) => {
-  return records.find(
-    (record) =>
-      String(record.Date).trim() === date &&
-      record["SMS Type"] === smsType
-  );
-};
-
-const toNumber = (value) => Number(value) || 0;
+/* ============================================================
+   FORMAT RESPONSE
+============================================================ */
 
 const formatRecord = (record, smsType, date) => {
   if (!record) {
@@ -102,34 +91,28 @@ const formatRecord = (record, smsType, date) => {
   }
 
   return {
-    date,
-    smsType,
-    status: record.Status,
-    alreadySent: record.Status === "COMPLETED",
-    sending: record.Status === "SENDING",
-    total: toNumber(record.Total),
-    successCount: toNumber(record.Sent),
-    failedCount: toNumber(record.Failed),
-    sentBy: record["Sent By"] || null,
-    sentAt: record["Sent At"] || null,
+    date: record.date ?? date,
+
+    smsType: record.smsType ?? smsType,
+
+    status: record.status ?? "NOT_SENT",
+
+    alreadySent:
+      record.status === "COMPLETED",
+
+    sending:
+      record.status === "SENDING",
+
+    total: toNumber(record.total),
+
+    successCount: toNumber(record.sent),
+
+    failedCount: toNumber(record.fail),
+
+    sentBy: record.sentBy || null,
+
+    sentAt: record.sentAt || null,
   };
-};
-
-/* ============================================================
-   SERIALIZE WRITES WITHIN THIS NODE PROCESS
-
-   Prevents overlapping writeSheet() operations within
-   one running backend instance.
-============================================================ */
-
-let writeQueue = Promise.resolve();
-
-const withWriteLock = (operation) => {
-  const result = writeQueue.then(operation);
-
-  writeQueue = result.catch(() => {});
-
-  return result;
 };
 
 /* ============================================================
@@ -139,18 +122,16 @@ const withWriteLock = (operation) => {
 export const getSMSStatus = async (smsType) => {
   validateType(smsType);
 
-  return withWriteLock(async () => {
-    const date = getToday();
-    const records = await readLogs();
+  const date = getToday();
 
-    const record = findTodayRecord(
-      records,
+  const record = await prisma.smsLog.findFirst({
+    where: {
+      date,
       smsType,
-      date
-    );
-
-    return formatRecord(record, smsType, date);
+    },
   });
+
+  return formatRecord(record, smsType, date);
 };
 
 /* ============================================================
@@ -158,44 +139,51 @@ export const getSMSStatus = async (smsType) => {
 ============================================================ */
 
 export const getTodaySMSStatuses = async () => {
-  return withWriteLock(async () => {
-    const date = getToday();
-    const records = await readLogs();
+  const date = getToday();
 
-    const doctorArrival = findTodayRecord(
-      records,
-      SMS_TYPES.DOCTOR_ARRIVAL,
-      date
-    );
-
-    const appointment = findTodayRecord(
-      records,
-      SMS_TYPES.APPOINTMENT,
-      date
-    );
-
-    return {
+  const records = await prisma.smsLog.findMany({
+    where: {
       date,
 
-      doctorArrival: formatRecord(
-        doctorArrival,
-        SMS_TYPES.DOCTOR_ARRIVAL,
-        date
-      ),
-
-      appointment: formatRecord(
-        appointment,
-        SMS_TYPES.APPOINTMENT,
-        date
-      ),
-    };
+      smsType: {
+        in: VALID_TYPES,
+      },
+    },
   });
+
+  const doctorArrival = records.find(
+    (record) =>
+      record.smsType ===
+      SMS_TYPES.DOCTOR_ARRIVAL,
+  );
+
+  const appointment = records.find(
+    (record) =>
+      record.smsType ===
+      SMS_TYPES.APPOINTMENT,
+  );
+
+  return {
+    date,
+
+    doctorArrival: formatRecord(
+      doctorArrival,
+      SMS_TYPES.DOCTOR_ARRIVAL,
+      date,
+    ),
+
+    appointment: formatRecord(
+      appointment,
+      SMS_TYPES.APPOINTMENT,
+      date,
+    ),
+  };
 };
 
 /* ============================================================
    CLAIM SMS BATCH
 
-   Create one record before SMS sending begins.
+   Only one batch per SMS type per day.
 ============================================================ */
 
 export const claimSMSBatch = async ({
@@ -205,65 +193,86 @@ export const claimSMSBatch = async ({
 }) => {
   validateType(smsType);
 
-  if (!Number.isInteger(total) || total < 1) {
-    const error = new Error("Invalid total SMS count");
-    error.statusCode = 400;
-    throw error;
+  if (
+    !Number.isInteger(total) ||
+    total < 1
+  ) {
+    throw createError(
+      "Invalid total SMS count",
+      400,
+    );
   }
 
-  return withWriteLock(async () => {
-    const date = getToday();
+  const date = getToday();
 
-    const records = await readLogs();
+  const token = randomUUID();
 
-    const existing = findTodayRecord(
-      records,
-      smsType,
-      date
-    );
+  try {
+    const record = await prisma.smsLog.create({
+      data: {
+        date,
+        smsType,
 
-    if (existing) {
+        status: "SENDING",
+
+        total,
+        sent: 0,
+        fail: 0,
+
+        sentBy:
+          String(sentBy || "Unknown"),
+
+        sentAt: null,
+
+        batchToken: token,
+      },
+    });
+
+    return {
+      success: true,
+      date: record.date,
+      smsType: record.smsType,
+      status: "SENDING",
+      token,
+    };
+  } catch (error) {
+    /*
+     * Unique constraint violation:
+     * Another batch already exists for
+     * the same date and SMS type.
+     */
+    if (error.code === "P2002") {
+      const existing =
+        await prisma.smsLog.findFirst({
+          where: {
+            date,
+            smsType,
+          },
+        });
+
       return {
         success: false,
+
         alreadySent:
-          existing.Status === "COMPLETED",
-        status: existing.Status,
+          existing?.status === "COMPLETED",
+
+        status:
+          existing?.status || "SENDING",
+
         message:
           "Today's SMS batch has already been started.",
       };
     }
 
-    const token = crypto.randomUUID();
-
-    records.push({
-      Date: date,
-      "SMS Type": smsType,
-      Status: "SENDING",
-      Total: String(total),
-      Sent: "0",
-      Failed: "0",
-      "Sent By": String(sentBy || "Unknown"),
-      "Sent At": "",
-      "Batch Token": token,
-    });
-
-    await writeSheet(SHEET_NAME, records);
-
-    return {
-      success: true,
-      date,
-      smsType,
-      status: "SENDING",
-      token,
-    };
-  });
+    throw error;
+  }
 };
 
 /* ============================================================
    COMPLETE SMS BATCH
 
-   Update the existing row.
-   Does not create another row.
+   Token-based lookup supports batches
+   that cross midnight.
 ============================================================ */
 
 export const completeSMSBatch = async ({
@@ -274,10 +283,14 @@ export const completeSMSBatch = async ({
 }) => {
   validateType(smsType);
 
-  if (!token || typeof token !== "string") {
-    const error = new Error("Batch token is required");
-    error.statusCode = 400;
-    throw error;
+  if (
+    !token ||
+    typeof token !== "string"
+  ) {
+    throw createError(
+      "Batch token is required",
+      400,
+    );
   }
 
   if (
@@ -286,72 +299,94 @@ export const completeSMSBatch = async ({
     successCount < 0 ||
     failedCount < 0
   ) {
-    const error = new Error("Invalid SMS counts");
-    error.statusCode = 400;
-    throw error;
+    throw createError(
+      "Invalid SMS counts",
+      400,
+    );
   }
 
-  return withWriteLock(async () => {
-    const date = getToday();
-
-    const records = await readLogs();
-
-    // Find by token so a batch crossing midnight
-    // can still complete its original record.
-    const record = records.find(
-      (item) =>
-        item["SMS Type"] === smsType &&
-        item["Batch Token"] === token
-    );
-
-    if (!record) {
-      const error = new Error(
-        "SMS batch not found"
-      );
-      error.statusCode = 404;
-      throw error;
-    }
-
-    if (record.Status !== "SENDING") {
-      const error = new Error(
-        "SMS batch is not in sending status"
-      );
-      error.statusCode = 409;
-      throw error;
-    }
-
-    const total = toNumber(record.Total);
-
-    if (successCount + failedCount !== total) {
-      const error = new Error(
-        "SMS counts do not match batch total"
-      );
-      error.statusCode = 400;
-      throw error;
-    }
-
-    const status =
-      failedCount === 0
-        ? "COMPLETED"
-        : successCount > 0
-          ? "PARTIAL"
-          : "FAILED";
-
-    record.Status = status;
-    record.Sent = String(successCount);
-    record.Failed = String(failedCount);
-    record["Sent At"] = getTimestamp();
-
-    await writeSheet(SHEET_NAME, records);
-
-    return {
-      success: true,
-      date: record.Date,
+  const record = await prisma.smsLog.findFirst({
+    where: {
       smsType,
-      status,
-      total,
-      successCount,
-      failedCount,
-    };
+      batchToken: token,
+    },
   });
+
+  if (!record) {
+    throw createError(
+      "SMS batch not found",
+      404,
+    );
+  }
+
+  if (record.status !== "SENDING") {
+    throw createError(
+      "SMS batch is not in sending status",
+      409,
+    );
+  }
+
+  const total = toNumber(record.total);
+
+  if (
+    successCount + failedCount !== total
+  ) {
+    throw createError(
+      "SMS counts do not match batch total",
+      400,
+    );
+  }
+
+  const status =
+    failedCount === 0
+      ? "COMPLETED"
+      : successCount > 0
+        ? "PARTIAL"
+        : "FAILED";
+
+  /*
+   * Conditional update prevents a second
+   * completion from overwriting this batch.
+   */
+  const updated =
+    await prisma.smsLog.updateMany({
+      where: {
+        id: record.id,
+        status: "SENDING",
+        batchToken: token,
+      },
+
+      data: {
+        status,
+
+        sent: successCount,
+
+        fail: failedCount,
+
+        sentAt: getTimestamp(),
+      },
+    });
+
+  if (updated.count !== 1) {
+    throw createError(
+      "SMS batch is not in sending status",
+      409,
+    );
+  }
+
+  return {
+    success: true,
+
+    date: record.date,
+
+    smsType,
+
+    status,
+
+    total,
+
+    successCount,
+
+    failedCount,
+  };
 };

@@ -1,3 +1,6 @@
+
+import prisma from "../config/prisma.js";
+
 import {
   readSheet,
   writeSheet,
@@ -10,12 +13,16 @@ import {
 
 import appError from "../utils/appError.js";
 
-const SHEET_NAME = "Dentists";
+/* ========================================================
+   CONFIGURATION
+======================================================== */
+
 const DOCTOR_ARRIVAL_SHEET = "Doctor_Arrival";
 
-/* --------------------------------------------------------
-   Helpers
--------------------------------------------------------- */
+/* ========================================================
+   HELPERS
+======================================================== */
+
 const normalizeDate = (value) => {
   if (!value) {
     return "";
@@ -44,40 +51,38 @@ function normalizeId(value) {
   return normalizeText(value).toLowerCase();
 }
 
+/* ========================================================
+   PRISMA RESPONSE MAPPER
+======================================================== */
+
 function normalizeDentist(dentist) {
   return {
     id: normalizeText(dentist?.id),
 
-    name: normalizeText(
-      dentist?.name,
-    ),
+    name: normalizeText(dentist?.name),
 
-    phone: normalizeText(
-      dentist?.phone,
-    ),
+    phone: normalizeText(dentist?.phone),
 
     specialization: normalizeText(
       dentist?.specialization,
     ),
 
     created_at: normalizeText(
-      dentist?.created_at,
+      dentist?.createdAt,
     ),
 
     updated_at: normalizeText(
-      dentist?.updated_at,
+      dentist?.updatedAt,
     ),
   };
 }
 
-async function getDentistRows() {
-  const rows = await readSheet(
-    SHEET_NAME,
-  );
+/* ========================================================
+   DATABASE HELPERS — POSTGRESQL
+======================================================== */
 
-  if (!Array.isArray(rows)) {
-    return [];
-  }
+async function getDentistRows() {
+  const rows = await prisma.dentist.findMany();
 
   return rows
     .filter(
@@ -92,12 +97,8 @@ async function getDentistRows() {
     );
 }
 
-function findDentistIndexById(
-  dentists,
-  id,
-) {
-  const normalizedDentistId =
-    normalizeId(id);
+function findDentistIndexById(dentists, id) {
+  const normalizedDentistId = normalizeId(id);
 
   return dentists.findIndex(
     (dentist) =>
@@ -106,92 +107,7 @@ function findDentistIndexById(
   );
 }
 
-/* --------------------------------------------------------
-   Create dentist
--------------------------------------------------------- */
-
-export async function createDentist(
-  data = {},
-) {
-  const name = normalizeText(
-    data.name,
-  );
-
-  const phone = normalizeText(
-    data.phone,
-  );
-
-  const specialization =
-    normalizeText(
-      data.specialization,
-    );
-
-  if (!name) {
-    throw appError(
-      "Dentist name is required",
-      400,
-    );
-  }
-
-  const dentists =
-    await getDentistRows();
-
-  const duplicateDentist =
-    dentists.find((dentist) => {
-      return (
-        normalizeText(
-          dentist.name,
-        ).toLowerCase() ===
-          name.toLowerCase() &&
-        normalizeText(
-          dentist.phone,
-        ) === phone
-      );
-    });
-
-  if (duplicateDentist) {
-    throw appError(
-      "A dentist with this name and phone number already exists",
-      409,
-    );
-  }
-
-  const timestamp = now();
-
-  const newDentist = {
-    id: createId("DEN"),
-
-    name,
-
-    phone,
-
-    specialization,
-
-    created_at:
-      timestamp,
-
-    updated_at:
-      timestamp,
-  };
-
-  dentists.push(newDentist);
-
-  await writeSheet(
-    SHEET_NAME,
-    dentists,
-  );
-
-  return newDentist;
-}
-
-/* --------------------------------------------------------
-   Get all dentists
--------------------------------------------------------- */
-
-export async function getAllDentists() {
-  const dentists =
-    await getDentistRows();
-
+function sortDentistsByName(dentists) {
   return dentists.sort(
     (first, second) =>
       first.name.localeCompare(
@@ -204,91 +120,129 @@ export async function getAllDentists() {
   );
 }
 
-/* --------------------------------------------------------
-   Search dentists
--------------------------------------------------------- */
+/* ========================================================
+   CREATE DENTIST — POSTGRESQL
+======================================================== */
 
-export async function searchDentists(
-  q,
-) {
-  const dentists =
-    await getDentistRows();
+export async function createDentist(data = {}) {
+  const name = normalizeText(data.name);
 
-  const keyword = normalizeText(
-    q,
-  ).toLowerCase();
+  const phone = normalizeText(data.phone);
 
-  if (!keyword) {
-    return dentists.sort(
-      (first, second) =>
-        first.name.localeCompare(
-          second.name,
-          undefined,
-          {
-            sensitivity: "base",
-          },
-        ),
+  const specialization = normalizeText(
+    data.specialization,
+  );
+
+  if (!name) {
+    throw appError(
+      "Dentist name is required",
+      400,
     );
   }
 
-  return dentists
-    .filter((dentist) => {
-      const dentistId =
-        normalizeText(
-          dentist.id,
-        ).toLowerCase();
+  const dentists = await getDentistRows();
 
-      const dentistName =
-        normalizeText(
-          dentist.name,
-        ).toLowerCase();
-
-      const dentistPhone =
-        normalizeText(
-          dentist.phone,
-        ).toLowerCase();
-
-      const specialization =
-        normalizeText(
-          dentist.specialization,
-        ).toLowerCase();
-
+  const duplicateDentist = dentists.find(
+    (dentist) => {
       return (
-        dentistId.includes(
-          keyword,
-        ) ||
-        dentistName.includes(
-          keyword,
-        ) ||
-        dentistPhone.includes(
-          keyword,
-        ) ||
-        specialization.includes(
-          keyword,
-        )
+        normalizeText(dentist.name).toLowerCase() ===
+          name.toLowerCase() &&
+        normalizeText(dentist.phone) === phone
       );
-    })
-    .sort(
-      (first, second) =>
-        first.name.localeCompare(
-          second.name,
-          undefined,
-          {
-            sensitivity: "base",
-          },
-        ),
+    },
+  );
+
+  if (duplicateDentist) {
+    throw appError(
+      "A dentist with this name and phone number already exists",
+      409,
     );
+  }
+
+  const timestamp = now();
+
+  const newDentist = await prisma.dentist.create({
+    data: {
+      id: createId("DEN"),
+
+      name,
+
+      phone,
+
+      specialization,
+
+      createdAt: timestamp,
+
+      updatedAt: timestamp,
+    },
+  });
+
+  return normalizeDentist(newDentist);
 }
 
-/* --------------------------------------------------------
-   Get dentist by ID
--------------------------------------------------------- */
+/* ========================================================
+   GET ALL DENTISTS — POSTGRESQL
+======================================================== */
 
-export async function getDentistById(
-  id,
-) {
-  const normalizedDentistId =
-    normalizeText(id);
+export async function getAllDentists() {
+  const dentists = await getDentistRows();
+
+  return sortDentistsByName(dentists);
+}
+
+/* ========================================================
+   SEARCH DENTISTS — POSTGRESQL
+======================================================== */
+
+export async function searchDentists(q) {
+  const keyword = normalizeText(q).toLowerCase();
+
+  if (!keyword) {
+    return getAllDentists();
+  }
+
+  const dentists = await prisma.dentist.findMany({
+    where: {
+      OR: [
+        {
+          id: {
+            contains: keyword,
+            mode: "insensitive",
+          },
+        },
+        {
+          name: {
+            contains: keyword,
+            mode: "insensitive",
+          },
+        },
+        {
+          phone: {
+            contains: keyword,
+            mode: "insensitive",
+          },
+        },
+        {
+          specialization: {
+            contains: keyword,
+            mode: "insensitive",
+          },
+        },
+      ],
+    },
+  });
+
+  return sortDentistsByName(
+    dentists.map(normalizeDentist),
+  );
+}
+
+/* ========================================================
+   GET DENTIST BY ID — POSTGRESQL
+======================================================== */
+
+export async function getDentistById(id) {
+  const normalizedDentistId = normalizeText(id);
 
   if (!normalizedDentistId) {
     throw appError(
@@ -297,17 +251,14 @@ export async function getDentistById(
     );
   }
 
-  const dentists =
-    await getDentistRows();
-
-  const dentist =
-    dentists.find(
-      (item) =>
-        normalizeId(item.id) ===
-        normalizeId(
-          normalizedDentistId,
-        ),
-    );
+  const dentist = await prisma.dentist.findFirst({
+    where: {
+      id: {
+        equals: normalizedDentistId,
+        mode: "insensitive",
+      },
+    },
+  });
 
   if (!dentist) {
     throw appError(
@@ -316,19 +267,15 @@ export async function getDentistById(
     );
   }
 
-  return dentist;
+  return normalizeDentist(dentist);
 }
 
-/* --------------------------------------------------------
-   Update dentist
--------------------------------------------------------- */
+/* ========================================================
+   UPDATE DENTIST — POSTGRESQL
+======================================================== */
 
-export async function updateDentist(
-  id,
-  data = {},
-) {
-  const normalizedDentistId =
-    normalizeText(id);
+export async function updateDentist(id, data = {}) {
+  const normalizedDentistId = normalizeText(id);
 
   if (!normalizedDentistId) {
     throw appError(
@@ -337,14 +284,12 @@ export async function updateDentist(
     );
   }
 
-  const dentists =
-    await getDentistRows();
+  const dentists = await getDentistRows();
 
-  const index =
-    findDentistIndexById(
-      dentists,
-      normalizedDentistId,
-    );
+  const index = findDentistIndexById(
+    dentists,
+    normalizedDentistId,
+  );
 
   if (index === -1) {
     throw appError(
@@ -353,17 +298,14 @@ export async function updateDentist(
     );
   }
 
-  const existing =
-    dentists[index];
+  const existing = dentists[index];
 
   const updatedName =
     Object.prototype.hasOwnProperty.call(
       data,
       "name",
     )
-      ? normalizeText(
-          data.name,
-        )
+      ? normalizeText(data.name)
       : existing.name;
 
   const updatedPhone =
@@ -371,9 +313,7 @@ export async function updateDentist(
       data,
       "phone",
     )
-      ? normalizeText(
-          data.phone,
-        )
+      ? normalizeText(data.phone)
       : existing.phone;
 
   const updatedSpecialization =
@@ -381,9 +321,7 @@ export async function updateDentist(
       data,
       "specialization",
     )
-      ? normalizeText(
-          data.specialization,
-        )
+      ? normalizeText(data.specialization)
       : existing.specialization;
 
   if (!updatedName) {
@@ -393,35 +331,27 @@ export async function updateDentist(
     );
   }
 
-  const duplicateDentist =
-    dentists.find(
-      (dentist) => {
-        const isCurrentDentist =
-          normalizeId(
-            dentist.id,
-          ) ===
-          normalizeId(
-            existing.id,
-          );
+  const duplicateDentist = dentists.find(
+    (dentist) => {
+      const isCurrentDentist =
+        normalizeId(dentist.id) ===
+        normalizeId(existing.id);
 
-        const hasSameName =
-          normalizeText(
-            dentist.name,
-          ).toLowerCase() ===
-          updatedName.toLowerCase();
+      const hasSameName =
+        normalizeText(dentist.name).toLowerCase() ===
+        updatedName.toLowerCase();
 
-        const hasSamePhone =
-          normalizeText(
-            dentist.phone,
-          ) === updatedPhone;
+      const hasSamePhone =
+        normalizeText(dentist.phone) ===
+        updatedPhone;
 
-        return (
-          !isCurrentDentist &&
-          hasSameName &&
-          hasSamePhone
-        );
-      },
-    );
+      return (
+        !isCurrentDentist &&
+        hasSameName &&
+        hasSamePhone
+      );
+    },
+  );
 
   if (duplicateDentist) {
     throw appError(
@@ -430,42 +360,31 @@ export async function updateDentist(
     );
   }
 
-  const updatedDentist = {
-    ...existing,
+  const updatedDentist = await prisma.dentist.update({
+    where: {
+      id: existing.id,
+    },
 
-    name:
-      updatedName,
+    data: {
+      name: updatedName,
 
-    phone:
-      updatedPhone,
+      phone: updatedPhone,
 
-    specialization:
-      updatedSpecialization,
+      specialization: updatedSpecialization,
 
-    updated_at:
-      now(),
-  };
+      updatedAt: now(),
+    },
+  });
 
-  dentists[index] =
-    updatedDentist;
-
-  await writeSheet(
-    SHEET_NAME,
-    dentists,
-  );
-
-  return updatedDentist;
+  return normalizeDentist(updatedDentist);
 }
 
-/* --------------------------------------------------------
-   Delete dentist
--------------------------------------------------------- */
+/* ========================================================
+   DELETE DENTIST — POSTGRESQL
+======================================================== */
 
-export async function deleteDentist(
-  id,
-) {
-  const normalizedDentistId =
-    normalizeText(id);
+export async function deleteDentist(id) {
+  const normalizedDentistId = normalizeText(id);
 
   if (!normalizedDentistId) {
     throw appError(
@@ -474,14 +393,12 @@ export async function deleteDentist(
     );
   }
 
-  const dentists =
-    await getDentistRows();
+  const dentists = await getDentistRows();
 
-  const index =
-    findDentistIndexById(
-      dentists,
-      normalizedDentistId,
-    );
+  const index = findDentistIndexById(
+    dentists,
+    normalizedDentistId,
+  );
 
   if (index === -1) {
     throw appError(
@@ -490,68 +407,63 @@ export async function deleteDentist(
     );
   }
 
-  const deletedDentist =
-    dentists[index];
+  const existing = dentists[index];
 
-  dentists.splice(
-    index,
-    1,
-  );
+  const deletedDentist = await prisma.dentist.delete({
+    where: {
+      id: existing.id,
+    },
+  });
 
-  await writeSheet(
-    SHEET_NAME,
-    dentists,
-  );
-
-  return deletedDentist;
+  return normalizeDentist(deletedDentist);
 }
 
-/* --------------------------------------------------------
-   Dentist statistics
--------------------------------------------------------- */
+/* ========================================================
+   DENTIST STATISTICS — POSTGRESQL
+======================================================== */
 
 export async function getDentistStatistics() {
-  const dentists =
-    await getDentistRows();
+  const dentists = await getDentistRows();
 
   const specializationCounts = {};
 
   dentists.forEach((dentist) => {
     const specialization =
-      normalizeText(
-        dentist.specialization,
-      ) || "General";
+      normalizeText(dentist.specialization) ||
+      "General";
 
-    specializationCounts[
-      specialization
-    ] =
-      (
-        specializationCounts[
-          specialization
-        ] || 0
-      ) + 1;
+    specializationCounts[specialization] =
+      (specializationCounts[specialization] || 0) + 1;
   });
 
   return {
-    total_dentists:
-      dentists.length,
+    total_dentists: dentists.length,
 
     specialization_breakdown:
       specializationCounts,
   };
 }
-export async function getDoctorArrivalStatus(date) {
 
+/* ========================================================
+   GET DOCTOR ARRIVAL STATUS
+   DATABASE: GOOGLE SHEETS (TEMPORARY)
+======================================================== */
+
+export async function getDoctorArrivalStatus(date) {
   const normalizedDate = normalizeDate(date);
 
   if (!normalizedDate) {
     throw new Error("Date is required");
   }
 
-  const records = await readSheet(DOCTOR_ARRIVAL_SHEET);
+  const records = await readSheet(
+    DOCTOR_ARRIVAL_SHEET,
+  );
 
   const arrivalRecord = records.find(
-    (record) => normalizeDate(record.date) === normalizedDate,
+    (record) =>
+      normalizeDate(record.date) ===
+      normalizedDate,
   );
 
   if (!arrivalRecord) {
@@ -566,21 +478,32 @@ export async function getDoctorArrivalStatus(date) {
 
   return {
     id: arrivalRecord.id || "",
+
     date: arrivalRecord.date || normalizedDate,
 
-    arrived: normalizeBoolean(arrivalRecord.arrived),
+    arrived: normalizeBoolean(
+      arrivalRecord.arrived,
+    ),
 
     arrived_at:
       arrivalRecord.arrived_at ||
       arrivalRecord.arrival_time ||
       null,
 
-    sms_sent: normalizeBoolean(arrivalRecord.sms_sent),
+    sms_sent: normalizeBoolean(
+      arrivalRecord.sms_sent,
+    ),
 
-    sms_count: Number(arrivalRecord.sms_count || 0),
+    sms_count: Number(
+      arrivalRecord.sms_count || 0,
+    ),
   };
-};
+}
 
+/* ========================================================
+   MARK DOCTOR ARRIVED
+   DATABASE: GOOGLE SHEETS (TEMPORARY)
+======================================================== */
 
 export async function markDoctorArrived({
   date,
@@ -592,57 +515,72 @@ export async function markDoctorArrived({
     throw new Error("Date is required");
   }
 
-  const records = await readSheet(DOCTOR_ARRIVAL_SHEET);
+  const records = await readSheet(
+    DOCTOR_ARRIVAL_SHEET,
+  );
+
+  const existingRecordIndex = records.findIndex(
+    (record) =>
+      normalizeDate(record.date) ===
+      normalizedDate,
+  );
 
   /*
    * Prevent duplicate doctor-arrival records
-   * and especially duplicate SMS sending.
+   * and duplicate SMS sending.
    */
-  const existingRecordIndex = records.findIndex(
-    (record) => normalizeDate(record.date) === normalizedDate,
-  );
 
   if (existingRecordIndex !== -1) {
-    const existingRecord = records[existingRecordIndex];
+    const existingRecord =
+      records[existingRecordIndex];
 
     if (normalizeBoolean(existingRecord.arrived)) {
       return {
         id: existingRecord.id || "",
-        date: existingRecord.date || normalizedDate,
+
+        date:
+          existingRecord.date ||
+          normalizedDate,
+
         arrived: true,
+
         arrived_at:
           existingRecord.arrived_at ||
           existingRecord.arrival_time ||
           null,
-        sms_sent: normalizeBoolean(existingRecord.sms_sent),
-        sms_count: Number(existingRecord.sms_count || 0),
+
+        sms_sent: normalizeBoolean(
+          existingRecord.sms_sent,
+        ),
+
+        sms_count: Number(
+          existingRecord.sms_count || 0,
+        ),
+
         already_arrived: true,
       };
     }
   }
 
-  const now = new Date().toISOString();
+  const timestamp = new Date().toISOString();
 
   const id = `DAR_${normalizedDate.replaceAll("-", "")}`;
 
   /*
-   * ======================================================
-   * SMS
-   * ======================================================
-   *
-   * For now smsCount is 0.
-   *
-   * Plug your SMS sending service into this section.
+   * SMS integration placeholder.
+   * Preserve existing behavior.
    */
+
   let smsCount = 0;
   let smsSent = false;
 
   if (sendSms) {
     try {
       /*
-       * Example:
+       * Future implementation:
        *
-       * const smsResult = await sendDoctorArrivalSms(normalizedDate);
+       * const smsResult =
+       *   await sendDoctorArrivalSms(normalizedDate);
        *
        * smsCount = smsResult.sentCount;
        * smsSent = smsCount > 0;
@@ -656,10 +594,6 @@ export async function markDoctorArrived({
         error,
       );
 
-      /*
-       * I recommend NOT failing doctor arrival just because
-       * the SMS provider failed.
-       */
       smsCount = 0;
       smsSent = false;
     }
@@ -667,36 +601,43 @@ export async function markDoctorArrived({
 
   const newRecord = {
     id,
+
     date: normalizedDate,
+
     arrived: true,
-    arrived_at: now,
+
+    arrived_at: timestamp,
+
     sms_sent: smsSent,
+
     sms_count: smsCount,
-    created_at: now,
-    updated_at: now,
+
+    created_at: timestamp,
+
+    updated_at: timestamp,
   };
 
-  /*
-   * Existing row for this date:
-   * update it instead of creating duplicate date rows.
-   */
   if (existingRecordIndex !== -1) {
     records[existingRecordIndex] = {
       ...records[existingRecordIndex],
+
       ...newRecord,
 
       created_at:
-        records[existingRecordIndex].created_at || now,
+        records[existingRecordIndex].created_at ||
+        timestamp,
     };
   } else {
     records.push(newRecord);
   }
 
-  await writeSheet(DOCTOR_ARRIVAL_SHEET, records);
+  await writeSheet(
+    DOCTOR_ARRIVAL_SHEET,
+    records,
+  );
 
   return {
     ...newRecord,
     already_arrived: false,
   };
-};
-
+}

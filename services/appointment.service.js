@@ -1,369 +1,39 @@
+
+import prisma from "../config/prisma.js";
 import appError from "../utils/appError.js";
-import { readSheet, writeSheet } from "../utils/googleSheets.js";
-
-const APPOINTMENTS_SHEET = "Appointments";
+import { readSheet } from "../utils/googleSheets.js";
 
 /* ========================================================
-   Helpers
+   HELPERS
 ======================================================== */
 
-/* ========================================================
-   TREATMENT PAYMENTS — INITIAL RECORD
-======================================================== */
+const normalizeText = (v) => String(v ?? "").trim();
+const normalizeId = normalizeText;
+const getNow = () => new Date().toISOString();
 
-const TREATMENT_PAYMENTS_SHEET = "treatment_payments";
-const COMMON_TREATMENTS_SHEET = "common_treatments";
+const toNumber = (v, fallback = 0) =>
+  Number.isFinite(Number(v)) ? Number(v) : fallback;
 
-function parseFee(value) {
-  if (value === undefined || value === null || value === "") {
-    return null;
-  }
+const getAppointmentId = (a) =>
+  normalizeId(a?.id ?? a?.appointment_id);
 
-  const fee = Number(value);
+const getTreatmentId = (t) =>
+  normalizeId(t?.id ?? t?.treatment_id);
 
-  if (!Number.isFinite(fee) || fee < 0) {
-    throw appError("Treatment fee must be a valid non-negative number", 400);
-  }
-
-  return Math.round((fee + Number.EPSILON) * 100) / 100;
-}
-
-async function resolveAppointmentPaymentData(data) {
-  const [patients, commonTreatments] = await Promise.all([
-    readSheet("Patients"),
-    readSheet(COMMON_TREATMENTS_SHEET),
-  ]);
-
-  const patient = patients.find(
-    (item) => getPatientId(item) === normalizeId(data.patient_id),
+const getTreatmentAppointmentId = (t) =>
+  normalizeId(
+    t?.appointment_id ??
+    t?.appointmentId ??
+    t?.appointmentID
   );
 
-  if (!patient) {
-    throw appError("Patient not found", 404);
-  }
-
-  const contactNumber = normalizeText(
-    patient.phone ?? patient.mobile ?? patient.contact_number,
+const isCancelledAppointment = (a) =>
+  ["cancelled", "canceled"].includes(
+    normalizeText(a?.status).toLowerCase()
   );
-
-  const treatmentName = normalizeText(data.reason_for_visit);
-
-  if (!treatmentName) {
-    throw appError("Reason for visit is required", 400);
-  }
-
-  const matchingTreatment = commonTreatments.find(
-    (item) =>
-      normalizeText(item.treatment_name).toLowerCase() ===
-      treatmentName.toLowerCase(),
-  );
-
-  const explicitFee = parseFee(data.treatment_fee);
-
-  const treatmentFee = explicitFee ?? parseFee(matchingTreatment?.fee) ?? 0;
-
-  return {
-    contactNumber,
-    treatmentName,
-    treatmentFee,
-  };
-}
-
-async function createInitialTreatmentPayment(appointment, paymentData) {
-  console.log('-----------------------------------------------------');
-  
-  console.log(appointment);
-console.log('-----------------------------------------------------');
-  
-  const records = await readSheet(TREATMENT_PAYMENTS_SHEET);
-
-  if (!Array.isArray(records)) {
-    throw appError("Unable to read treatment payments", 500);
-  }
-
-  const appointmentId = getAppointmentId(appointment);
-
-  const existing = records.find(
-    (record) => normalizeId(record.appointment_id) === appointmentId,
-  );
-
-  // Never create two payment records for one appointment.
-  if (existing) {
-    return existing;
-  }
-
-  const timestamp = getNow();
-
-  const paymentRecord = {
-    id: `TP_${appointmentId}`,
-    appointment_id: appointmentId,
-    patient_id: normalizeId(appointment.patient_id),
-    contact_number: paymentData.contactNumber,
-    treatment_name: paymentData.treatmentName,
-    treatment_fee: paymentData.treatmentFee,
-    payment_amount: 0,
-    total_paid: 0,
-    remaining_amount: paymentData.treatmentFee,
-    payment_method: "",
-    payment_type: "",
-    payment_status: "Unpaid",
-    payment_history: "[]",
-    created_at: timestamp,
-    updated_at: timestamp,
-  };
-
-  records.push(paymentRecord);
-
-  await writeSheet(TREATMENT_PAYMENTS_SHEET, records);
-
-  return paymentRecord;
-}
-
-const normalizeText = (value) => {
-  return String(value ?? "").trim();
-};
 
 /* ========================================================
-   Reassign / Swap Appointment Number
-======================================================== */
-
-export const reassignAppointmentNumberService = async (
-  sourceAppointmentId,
-  targetAppointmentId,
-) => {
-  const sourceId = normalizeText(sourceAppointmentId);
-  const targetId = normalizeText(targetAppointmentId);
-
-  if (!sourceId) {
-    throw appError("Source appointment ID is required", 400);
-  }
-
-  if (!targetId) {
-    throw appError("Target appointment ID is required", 400);
-  }
-
-  if (normalizeId(sourceId) === normalizeId(targetId)) {
-    throw appError("Source and target appointments cannot be the same", 400);
-  }
-
-  /* ========================================================
-     Read appointments
-  ======================================================== */
-
-  const appointments = await readSheet(APPOINTMENTS_SHEET);
-
-  if (!Array.isArray(appointments)) {
-    throw appError("Failed to load appointments", 500);
-  }
-
-  /* ========================================================
-     Find source appointment
-  ======================================================== */
-
-  const sourceIndex = appointments.findIndex((appointment) => {
-    const appointmentId = appointment?.appointment_id ?? appointment?.id;
-
-    return normalizeId(appointmentId) === normalizeId(sourceId);
-  });
-
-  if (sourceIndex === -1) {
-    throw appError("Source appointment not found", 404);
-  }
-
-  /* ========================================================
-     Find target appointment
-  ======================================================== */
-
-  const targetIndex = appointments.findIndex((appointment) => {
-    const appointmentId = appointment?.appointment_id ?? appointment?.id;
-
-    return normalizeId(appointmentId) === normalizeId(targetId);
-  });
-
-  if (targetIndex === -1) {
-    throw appError("Target appointment not found", 404);
-  }
-
-  const sourceAppointment = appointments[sourceIndex];
-  const targetAppointment = appointments[targetIndex];
-
-  /* ========================================================
-     Validate source is cancelled
-  ======================================================== */
-
-  const sourceStatus = normalizeText(sourceAppointment?.status).toLowerCase();
-
-  if (sourceStatus !== "cancelled" && sourceStatus !== "canceled") {
-    throw appError(
-      "Only a cancelled appointment number can be reassigned",
-      400,
-    );
-  }
-
-  /* ========================================================
-     Validate target status
-  ======================================================== */
-
-  const targetStatus = normalizeText(targetAppointment?.status).toLowerCase();
-
-  const allowedTargetStatuses = ["pending", "confirmed", "checked in"];
-
-  if (!allowedTargetStatuses.includes(targetStatus)) {
-    throw appError(
-      "The selected appointment cannot receive this appointment number",
-      400,
-    );
-  }
-
-  /* ========================================================
-     Validate same appointment date
-  ======================================================== */
-
-  const sourceDate = normalizeText(sourceAppointment?.appointment_date);
-
-  const targetDate = normalizeText(targetAppointment?.appointment_date);
-
-  if (!sourceDate || !targetDate) {
-    throw appError("Both appointments must have an appointment date", 400);
-  }
-
-  if (sourceDate !== targetDate) {
-    throw appError(
-      "Appointment numbers can only be reassigned on the same date",
-      400,
-    );
-  }
-
-  /* ========================================================
-     Get cancelled appointment number
-  ======================================================== */
-
-  const sourceAppointmentNumber =
-    sourceAppointment?.appointment_number ??
-    sourceAppointment?.queue_number ??
-    sourceAppointment?.number;
-
-  if (
-    sourceAppointmentNumber === undefined ||
-    sourceAppointmentNumber === null ||
-    sourceAppointmentNumber === ""
-  ) {
-    throw appError(
-      "Cancelled appointment does not have an appointment number",
-      400,
-    );
-  }
-
-  const targetOldAppointmentNumber =
-    targetAppointment?.appointment_number ??
-    targetAppointment?.queue_number ??
-    targetAppointment?.number ??
-    "";
-
-  /* ========================================================
-     Make sure another active appointment is not already
-     using the cancelled appointment number
-  ======================================================== */
-
-  const numberAlreadyUsed = appointments.some((appointment, index) => {
-    if (index === sourceIndex || index === targetIndex) {
-      return false;
-    }
-
-    const appointmentDate = normalizeText(appointment?.appointment_date);
-
-    if (appointmentDate !== sourceDate) {
-      return false;
-    }
-
-    const status = normalizeText(appointment?.status).toLowerCase();
-
-    if (status === "cancelled" || status === "canceled") {
-      return false;
-    }
-
-    const appointmentNumber =
-      appointment?.appointment_number ??
-      appointment?.queue_number ??
-      appointment?.number;
-
-    return String(appointmentNumber) === String(sourceAppointmentNumber);
-  });
-
-  if (numberAlreadyUsed) {
-    throw appError(
-      `Appointment number ${sourceAppointmentNumber} is already being used`,
-      409,
-    );
-  }
-
-  /* ========================================================
-     Reassign appointment number
-
-     Example:
-
-     Cancelled:
-       PAT_d9351296 -> #2
-
-     Target:
-       P0002 -> #6
-
-     Result:
-       PAT_d9351296 -> no number
-       P0002 -> #2
-  ======================================================== */
-
-  const now = new Date().toISOString();
-
-  appointments[sourceIndex] = {
-    ...sourceAppointment,
-
-    appointment_number: "",
-
-    updated_at: now,
-  };
-
-  appointments[targetIndex] = {
-    ...targetAppointment,
-
-    appointment_number: sourceAppointmentNumber,
-
-    updated_at: now,
-  };
-
-  /* ========================================================
-     Save appointments
-  ======================================================== */
-
-  await writeSheet(APPOINTMENTS_SHEET, appointments);
-
-  /* ========================================================
-     Response
-  ======================================================== */
-
-  return {
-    message: `Appointment number ${sourceAppointmentNumber} reassigned successfully`,
-
-    releasedAppointment: appointments[sourceIndex],
-
-    reassignedAppointment: appointments[targetIndex],
-
-    reassignment: {
-      appointmentNumber: sourceAppointmentNumber,
-
-      sourceAppointmentId:
-        sourceAppointment?.appointment_id ?? sourceAppointment?.id,
-
-      targetAppointmentId:
-        targetAppointment?.appointment_id ?? targetAppointment?.id,
-
-      targetOldAppointmentNumber,
-      targetNewAppointmentNumber: sourceAppointmentNumber,
-    },
-  };
-};
-/* ========================================================
-   Constants
+   STATUS CONFIGURATION
 ======================================================== */
 
 const APPOINTMENT_STATUSES = [
@@ -381,135 +51,180 @@ const APPOINTMENT_STATUSES = [
 
 const ALLOWED_STATUS_TRANSITIONS = {
   Pending: ["Confirmed", "Checked In", "Cancelled"],
-
   Confirmed: ["Checked In", "Cancelled"],
-
   "Checked In": ["Waiting", "In Treatment", "Cancelled"],
-
   Waiting: ["In Treatment", "Cancelled"],
-
   "In Treatment": ["Treatment Done"],
-
   "Treatment Done": ["Payment Pending", "Paid"],
-
   "Payment Pending": ["Paid", "Completed"],
-
   Paid: ["Completed"],
-
   Completed: [],
   Cancelled: [],
 };
 
 /* ========================================================
-   General helpers
+   PRISMA APPOINTMENT MAPPER
 ======================================================== */
 
-function getNow() {
-  return new Date().toISOString();
+function mapAppointment(a) {
+  if (!a) return null;
+
+  const number = a.appointmentNumber;
+
+  return {
+    id: a.id,
+    patient_id: a.patientId ?? "",
+    dentist_id: a.dentistId ?? "",
+
+    appointment_number:
+      number === null || number === undefined
+        ? ""
+        : /^\d+$/.test(number)
+          ? Number(number)
+          : number,
+
+    appointment_date: a.appointmentDate ?? "",
+    appointment_time: a.appointmentTime ?? "",
+    reason_for_visit: a.reasonForVisit ?? "",
+    status: a.status ?? "",
+
+    checked_in_time: a.checkedInTime ?? "",
+    treatment_started_at: a.treatmentStartedAt ?? "",
+    treatment_completed_at: a.treatmentCompletedAt ?? "",
+    completed_at: a.completedAt ?? "",
+
+    created_at: a.createdAt ?? "",
+    updated_at: a.updatedAt ?? "",
+  };
 }
 
-function normalizeId(value) {
-  return String(value ?? "").trim();
-}
-
-function toNumber(value, fallback = 0) {
-  const numberValue = Number(value);
-
-  return Number.isFinite(numberValue) ? numberValue : fallback;
-}
-
-function getAppointmentId(appointment) {
-  return normalizeId(appointment?.id ?? appointment?.appointment_id);
-}
-
-function getPatientId(patient) {
-  return normalizeId(patient?.id ?? patient?.patient_id);
-}
-
-function getDentistId(dentist) {
-  return normalizeId(dentist?.id ?? dentist?.dentist_id);
-}
-
-function getTreatmentId(treatment) {
-  return normalizeId(treatment?.id ?? treatment?.treatment_id);
-}
-
-function getTreatmentAppointmentId(treatment) {
-  return normalizeId(
-    treatment?.appointment_id ??
-      treatment?.appointmentId ??
-      treatment?.appointmentID,
+function compareAppointments(a, b) {
+  return (
+    normalizeText(
+      a?.appointment_date ?? a?.date
+    ).localeCompare(
+      normalizeText(b?.appointment_date ?? b?.date)
+    ) ||
+    normalizeText(a?.appointment_time).localeCompare(
+      normalizeText(b?.appointment_time)
+    )
   );
 }
 
-function isCancelledAppointment(appointment) {
-  return normalizeText(appointment?.status).toLowerCase() === "cancelled";
-}
+function generateAppointmentId(appointments, date) {
+  const prefix = `APP_${date.replaceAll("-", "")}_`;
 
-function compareAppointments(first, second) {
-  const firstDate = normalizeText(first?.appointment_date ?? first?.date);
+  let max = 0;
 
-  const secondDate = normalizeText(second?.appointment_date ?? second?.date);
+  for (const appointment of appointments) {
+    const id = getAppointmentId(appointment);
 
-  const dateComparison = firstDate.localeCompare(secondDate);
+    if (!id.startsWith(prefix)) continue;
 
-  if (dateComparison !== 0) {
-    return dateComparison;
+    const number = Number(id.slice(prefix.length));
+
+    if (Number.isInteger(number) && number > max) {
+      max = number;
+    }
   }
 
-  const firstTime = normalizeText(first?.appointment_time);
-
-  const secondTime = normalizeText(second?.appointment_time);
-
-  return firstTime.localeCompare(secondTime);
+  return `${prefix}${String(max + 1).padStart(4, "0")}`;
 }
 
-function filterByDateRange(records, dateField, startDate, endDate) {
-  return records.filter((record) => {
-    const recordDate = normalizeText(record?.[dateField]).slice(0, 10);
+function parseFee(value) {
+  if (
+    value === undefined ||
+    value === null ||
+    value === ""
+  ) {
+    return null;
+  }
 
-    return recordDate && recordDate >= startDate && recordDate <= endDate;
-  });
-}
+  const fee = Number(value);
 
-/* ========================================================
-   Appointment ID generator
-======================================================== */
+  if (!Number.isFinite(fee) || fee < 0) {
+    throw appError(
+      "Treatment fee must be a valid non-negative number",
+      400
+    );
+  }
 
-function generateAppointmentId(appointments, appointmentDate) {
-  const formattedDate = appointmentDate.replaceAll("-", "");
-
-  const idPrefix = `APP_${formattedDate}_`;
-
-  let highestNumber = 0;
-
-  appointments.forEach((appointment) => {
-    const appointmentId = getAppointmentId(appointment);
-
-    if (!appointmentId.startsWith(idPrefix)) {
-      return;
-    }
-
-    const numberPart = appointmentId.slice(idPrefix.length);
-
-    const appointmentNumber = Number(numberPart);
-
-    if (
-      Number.isInteger(appointmentNumber) &&
-      appointmentNumber > highestNumber
-    ) {
-      highestNumber = appointmentNumber;
-    }
-  });
-
-  return `${idPrefix}${String(highestNumber + 1).padStart(4, "0")}`;
+  return Math.round((fee + Number.EPSILON) * 100) / 100;
 }
 
 /* ========================================================
-   Payment summary helper
+   DATABASE HELPERS
 ======================================================== */
 
-function createTreatmentPaymentData({ treatment, payments }) {
+async function getAppointmentsRows(db = prisma) {
+  const records = await db.appointment.findMany();
+
+  return records.map(mapAppointment);
+}
+
+async function getPeopleMaps() {
+  const [patients, dentists] = await Promise.all([
+    prisma.patient.findMany(),
+    prisma.dentist.findMany(),
+  ]);
+
+  return [
+    new Map(patients.map((patient) => [patient.id, patient])),
+    new Map(dentists.map((dentist) => [dentist.id, dentist])),
+  ];
+}
+
+async function resolveAppointmentPaymentData(
+  data,
+  db = prisma
+) {
+  const patient = await db.patient.findUnique({
+    where: {
+      id: normalizeId(data.patient_id),
+    },
+  });
+
+  if (!patient) {
+    throw appError("Patient not found", 404);
+  }
+
+  const treatmentName = normalizeText(
+    data.reason_for_visit
+  );
+
+  if (!treatmentName) {
+    throw appError("Reason for visit is required", 400);
+  }
+
+  const matchingTreatment =
+    await db.commonTreatment.findFirst({
+      where: {
+        treatmentName: {
+          equals: treatmentName,
+          mode: "insensitive",
+        },
+      },
+    });
+
+  const treatmentFee =
+    parseFee(data.treatment_fee) ??
+    parseFee(matchingTreatment?.fee) ??
+    0;
+
+  return {
+    treatmentName,
+    treatmentFee,
+  };
+}
+
+/* ========================================================
+   LEGACY TREATMENT AND PAYMENT HELPERS
+======================================================== */
+
+function createTreatmentPaymentData({
+  treatment,
+  payments,
+}) {
   if (!treatment) {
     return {
       treatmentId: "",
@@ -524,28 +239,38 @@ function createTreatmentPaymentData({ treatment, payments }) {
   const treatmentId = getTreatmentId(treatment);
 
   const treatmentFee = toNumber(
-    treatment?.treatment_fee ?? treatment?.treatment_charge,
+    treatment?.treatment_fee ??
+    treatment?.treatment_charge
   );
 
   const treatmentPayments = treatmentId
-    ? payments.filter((payment) => {
-        return normalizeId(payment?.treatment_id) === treatmentId;
-      })
+    ? payments.filter(
+        (payment) =>
+          normalizeId(payment?.treatment_id) ===
+          treatmentId
+      )
     : [];
 
-  const totalPaid = treatmentPayments.reduce((total, payment) => {
-    return total + toNumber(payment?.payment_amount ?? payment?.amount);
-  }, 0);
+  const totalPaid = treatmentPayments.reduce(
+    (sum, payment) =>
+      sum +
+      toNumber(
+        payment?.payment_amount ?? payment?.amount
+      ),
+    0
+  );
 
-  const remainingAmount = Math.max(treatmentFee - totalPaid, 0);
+  const remainingAmount = Math.max(
+    treatmentFee - totalPaid,
+    0
+  );
 
-  let paymentStatus = "Not Paid";
-
-  if (treatmentFee > 0 && totalPaid >= treatmentFee) {
-    paymentStatus = "Paid";
-  } else if (totalPaid > 0) {
-    paymentStatus = "Partial";
-  }
+  const paymentStatus =
+    treatmentFee > 0 && totalPaid >= treatmentFee
+      ? "Paid"
+      : totalPaid > 0
+        ? "Partial"
+        : "Not Paid";
 
   return {
     treatmentId,
@@ -557,12 +282,323 @@ function createTreatmentPaymentData({ treatment, payments }) {
   };
 }
 
-/* ========================================================
-   Create appointment
-======================================================== */
+function generateQueue(appointments) {
+  const counters = {};
+
+  return appointments.map((appointment) => {
+    if (isCancelledAppointment(appointment)) {
+      return null;
+    }
+
+    const date = normalizeText(
+      appointment.appointment_date
+    );
+
+    counters[date] = (counters[date] ?? 0) + 1;
+
+    return counters[date];
+  });
+}
+
+async function getLegacyTreatmentData() {
+  const [treatments, payments] = await Promise.all([
+    readSheet("Treatments"),
+    readSheet("Payments"),
+  ]);
+
+  return {
+    treatments,
+    payments,
+  };
+}
+
+function treatmentMapFor(treatments) {
+  const map = new Map();
+
+  for (const treatment of treatments) {
+    const appointmentId =
+      getTreatmentAppointmentId(treatment);
+
+    if (appointmentId && !map.has(appointmentId)) {
+      map.set(appointmentId, treatment);
+    }
+  }
+
+  return map;
+}
 
 /* ========================================================
-   CREATE APPOINTMENT + INITIAL TREATMENT PAYMENT
+   ENRICHED APPOINTMENT RESPONSE
+======================================================== */
+
+function enrichedAppointment(
+  appointment,
+  queueNo,
+  patient,
+  dentist,
+  treatment,
+  payments,
+  includePayments = false
+) {
+  const {
+    treatmentId,
+    treatmentFee,
+    treatmentPayments,
+    totalPaid,
+    remainingAmount,
+    paymentStatus,
+  } = createTreatmentPaymentData({
+    treatment,
+    payments,
+  });
+
+  const result = {
+    queue_no: queueNo,
+
+    appointment_id: appointment.id,
+    id: appointment.id,
+
+    patient_id: appointment.patient_id,
+    patient_name: patient?.name ?? "",
+    phone: patient?.phone ?? "",
+    age: patient?.age ?? "",
+    gender: patient?.gender ?? "",
+    address: patient?.address ?? "",
+
+    dentist_id: appointment.dentist_id,
+    dentist_name: dentist?.name ?? "",
+
+    appointment_date: appointment.appointment_date,
+    appointment_time: appointment.appointment_time,
+    appointment_number: appointment.appointment_number,
+
+    checked_in_time: appointment.checked_in_time,
+    treatment_started_at:
+      appointment.treatment_started_at,
+    treatment_completed_at:
+      appointment.treatment_completed_at,
+
+    reason_for_visit: appointment.reason_for_visit,
+    status: appointment.status,
+
+    treatment_id: treatmentId,
+    treatment_date: treatment?.treatment_date ?? "",
+    next_appointment_date:
+      treatment?.next_appointment_date ?? "",
+
+    diagnosis: treatment?.diagnosis ?? "",
+    tooth_number: treatment?.tooth_number ?? "",
+
+    treatment_details:
+      treatment?.treatment_details ??
+      treatment?.treatment_performed ??
+      "",
+
+    doctor_notes: treatment?.doctor_notes ?? "",
+    prescription: treatment?.prescription ?? "",
+
+    treatment_fee: treatmentFee,
+    treatment_charge: treatmentFee,
+    total_paid: totalPaid,
+    remaining_amount: remainingAmount,
+    payment_status: paymentStatus,
+    payment_count: treatmentPayments.length,
+
+    created_at: appointment.created_at,
+    updated_at: appointment.updated_at,
+  };
+
+  if (includePayments) {
+    result.completed_at = appointment.completed_at;
+    result.payments = treatmentPayments;
+  }
+
+  return result;
+}
+
+/* ========================================================
+   1. REASSIGN APPOINTMENT NUMBER
+======================================================== */
+
+export async function reassignAppointmentNumberService(
+  sourceAppointmentId,
+  targetAppointmentId
+) {
+  const sourceId = normalizeId(sourceAppointmentId);
+  const targetId = normalizeId(targetAppointmentId);
+
+  if (!sourceId) {
+    throw appError(
+      "Source appointment ID is required",
+      400
+    );
+  }
+
+  if (!targetId) {
+    throw appError(
+      "Target appointment ID is required",
+      400
+    );
+  }
+
+  if (sourceId === targetId) {
+    throw appError(
+      "Source and target appointments cannot be the same",
+      400
+    );
+  }
+
+  return prisma.$transaction(
+    async (tx) => {
+      await tx.$executeRaw`
+        LOCK TABLE "appointments" IN EXCLUSIVE MODE
+      `;
+
+      const [source, target] = await Promise.all([
+        tx.appointment.findUnique({
+          where: { id: sourceId },
+        }),
+        tx.appointment.findUnique({
+          where: { id: targetId },
+        }),
+      ]);
+
+      if (!source) {
+        throw appError(
+          "Source appointment not found",
+          404
+        );
+      }
+
+      if (!target) {
+        throw appError(
+          "Target appointment not found",
+          404
+        );
+      }
+
+      if (!isCancelledAppointment(source)) {
+        throw appError(
+          "Only a cancelled appointment number can be reassigned",
+          400
+        );
+      }
+
+      const targetStatus = normalizeText(
+        target.status
+      ).toLowerCase();
+
+      if (
+        !["pending", "confirmed", "checked in"].includes(
+          targetStatus
+        )
+      ) {
+        throw appError(
+          "The selected appointment cannot receive this appointment number",
+          400
+        );
+      }
+
+      if (
+        !source.appointmentDate ||
+        !target.appointmentDate
+      ) {
+        throw appError(
+          "Both appointments must have an appointment date",
+          400
+        );
+      }
+
+      if (
+        source.appointmentDate !==
+        target.appointmentDate
+      ) {
+        throw appError(
+          "Appointment numbers can only be reassigned on the same date",
+          400
+        );
+      }
+
+      const number = source.appointmentNumber;
+
+      if (number === null || number === "") {
+        throw appError(
+          "Cancelled appointment does not have an appointment number",
+          400
+        );
+      }
+
+      const others = await tx.appointment.findMany({
+        where: {
+          appointmentDate: source.appointmentDate,
+          appointmentNumber: number,
+          id: {
+            notIn: [sourceId, targetId],
+          },
+        },
+      });
+
+      if (
+        others.some(
+          (appointment) =>
+            !isCancelledAppointment(appointment)
+        )
+      ) {
+        throw appError(
+          `Appointment number ${number} is already being used`,
+          409
+        );
+      }
+
+      const timestamp = getNow();
+
+      const released = await tx.appointment.update({
+        where: { id: sourceId },
+        data: {
+          appointmentNumber: "",
+          updatedAt: timestamp,
+        },
+      });
+
+      const reassigned = await tx.appointment.update({
+        where: { id: targetId },
+        data: {
+          appointmentNumber: number,
+          updatedAt: timestamp,
+        },
+      });
+
+      const displayNumber = /^\d+$/.test(number)
+        ? Number(number)
+        : number;
+
+      return {
+        message:
+          `Appointment number ${number} reassigned successfully`,
+
+        releasedAppointment: mapAppointment(released),
+
+        reassignedAppointment:
+          mapAppointment(reassigned),
+
+        reassignment: {
+          appointmentNumber: displayNumber,
+          sourceAppointmentId: sourceId,
+          targetAppointmentId: targetId,
+          targetOldAppointmentNumber:
+            mapAppointment(target).appointment_number,
+          targetNewAppointmentNumber: displayNumber,
+        },
+      };
+    },
+    {
+      timeout: 15000,
+    }
+  );
+}
+
+/* ========================================================
+   2. CREATE APPOINTMENT + INITIAL PAYMENT
 ======================================================== */
 
 export async function createAppointment(data) {
@@ -582,805 +618,729 @@ export async function createAppointment(data) {
     throw appError("Appointment time is required", 400);
   }
 
-  const requestedStatus = normalizeText(data.status) || "Pending";
+  const status =
+    normalizeText(data.status) || "Pending";
 
-  if (!APPOINTMENT_STATUSES.includes(requestedStatus)) {
-    throw appError(`Invalid appointment status: ${requestedStatus}`, 400);
-  }
-
-  const appointments = await readSheet(APPOINTMENTS_SHEET);
-
-  if (!Array.isArray(appointments)) {
-    throw appError("Failed to load appointments", 500);
-  }
-
-  const appointmentDate = normalizeText(data.appointment_date);
-  const appointmentTime = normalizeText(data.appointment_time);
-
-  const duplicateAppointment = appointments.find((appointment) => {
-    return (
-      normalizeId(appointment?.patient_id) === normalizeId(data.patient_id) &&
-      normalizeText(appointment?.appointment_date) === appointmentDate &&
-      normalizeText(appointment?.appointment_time) === appointmentTime &&
-      !isCancelledAppointment(appointment)
-    );
-  });
-
-  if (duplicateAppointment && !data.is_skipped) {
+  if (!APPOINTMENT_STATUSES.includes(status)) {
     throw appError(
-      "This patient already has an appointment at the selected date and time",
-      409,
+      `Invalid appointment status: ${status}`,
+      400
     );
   }
 
-  // Validate and resolve payment details before saving appointment.
-  const paymentData = await resolveAppointmentPaymentData(data);
+  const date = normalizeText(data.appointment_date);
+  const time = normalizeText(data.appointment_time);
 
-  const sameDayAppointments = appointments.filter((appointment) => {
-    return (
-      normalizeText(appointment?.appointment_date) === appointmentDate &&
-      !isCancelledAppointment(appointment)
-    );
-  });
+  return prisma.$transaction(
+    async (tx) => {
+      await tx.$executeRaw`
+        LOCK TABLE "appointments" IN EXCLUSIVE MODE
+      `;
 
-  const timestamp = getNow();
+      const appointments = (
+        await tx.appointment.findMany()
+      ).map(mapAppointment);
 
-  const appointment = {
-    id: generateAppointmentId(appointments, appointmentDate),
+      const duplicate = appointments.some(
+        (appointment) =>
+          appointment.patient_id ===
+            normalizeId(data.patient_id) &&
+          appointment.appointment_date === date &&
+          appointment.appointment_time === time &&
+          !isCancelledAppointment(appointment)
+      );
 
-    patient_id: normalizeId(data.patient_id),
-    dentist_id: normalizeId(data.dentist_id),
+      if (duplicate && !data.is_skipped) {
+        throw appError(
+          "This patient already has an appointment at the selected date and time",
+          409
+        );
+      }
 
-    appointment_number:
-      data.appointment_number ?? sameDayAppointments.length + 1,
+      const paymentData =
+        await resolveAppointmentPaymentData(
+          data,
+          tx
+        );
 
-    appointment_date: appointmentDate,
-    appointment_time: appointmentTime,
+      const dentist =
+        await tx.dentist.findUnique({
+          where: {
+            id: normalizeId(data.dentist_id),
+          },
+        });
 
-    reason_for_visit: normalizeText(data.reason_for_visit),
+      if (!dentist) {
+        throw appError("Dentist not found", 404);
+      }
 
-    status: requestedStatus,
+      const count = appointments.filter(
+        (appointment) =>
+          appointment.appointment_date === date &&
+          !isCancelledAppointment(appointment)
+      ).length;
 
-    checked_in_time: "",
-    treatment_started_at: "",
-    treatment_completed_at: "",
-    completed_at: "",
+      const timestamp = getNow();
 
-    created_at: timestamp,
-    updated_at: timestamp,
-  };
+      const id = generateAppointmentId(
+        appointments,
+        date
+      );
 
-  appointments.push(appointment);
+      const appointment =
+        await tx.appointment.create({
+          data: {
+            id,
 
-  await writeSheet(APPOINTMENTS_SHEET, appointments);
+            patientId: normalizeId(data.patient_id),
+            dentistId: normalizeId(data.dentist_id),
 
-  // Automatically create the corresponding payment record.
-  try {
-    await createInitialTreatmentPayment(appointment, paymentData);
-  } catch (error) {
-    console.error(
-      `Payment initialization failed for appointment ${appointment.id}:`,
-      error,
-    );
+            appointmentNumber: String(
+              data.appointment_number ?? count + 1
+            ),
 
-    // Appointment is already saved. Do not silently report
-    // an ordinary booking failure or blindly retry creation.
-    throw appError(
-      `Appointment ${appointment.id} was created, but its payment record could not be initialized. Please reconcile this appointment before retrying.`,
-      500,
-    );
-  }
+            appointmentDate: date,
+            appointmentTime: time,
 
-  return appointment;
+            reasonForVisit: paymentData.treatmentName,
+
+            status,
+
+            checkedInTime: "",
+            treatmentStartedAt: "",
+            treatmentCompletedAt: "",
+            completedAt: "",
+
+            createdAt: timestamp,
+            updatedAt: timestamp,
+          },
+        });
+
+      await tx.treatmentPayment.create({
+        data: {
+          id: `TP_${id}`,
+
+          appointmentId: id,
+          treatmentId: null,
+
+          patientId: normalizeId(data.patient_id),
+          treatmentName: paymentData.treatmentName,
+
+          totalFee: paymentData.treatmentFee,
+          paymentType: "",
+          totalPaid: 0,
+          balance: paymentData.treatmentFee,
+
+          paymentHistory: [],
+          status: "Unpaid",
+
+          createdAt: timestamp,
+          updatedAt: timestamp,
+        },
+      });
+
+      return mapAppointment(appointment);
+    },
+    {
+      timeout: 15000,
+    }
+  );
 }
 
 /* ========================================================
-   Get all appointments
+   3. GET ALL APPOINTMENTS
 ======================================================== */
 
 export async function getAllAppointments() {
-  const [appointments, patients, dentists] = await Promise.all([
-    readSheet("Appointments"),
-    readSheet("Patients"),
-    readSheet("Dentists"),
+  const [
+    appointments,
+    [patientMap, dentistMap],
+  ] = await Promise.all([
+    getAppointmentsRows(),
+    getPeopleMaps(),
   ]);
 
-  const sortedAppointments = [...appointments].sort(compareAppointments);
+  appointments.sort(compareAppointments);
 
-  const patientMap = new Map(
-    patients.map((patient) => [getPatientId(patient), patient]),
-  );
+  const queue = generateQueue(appointments);
 
-  const dentistMap = new Map(
-    dentists.map((dentist) => [getDentistId(dentist), dentist]),
-  );
+  return appointments.map((appointment, index) => ({
+    ...appointment,
 
-  const queueMap = {};
+    queue_number: queue[index],
 
-  return sortedAppointments.map((appointment) => {
-    const appointmentDate = normalizeText(appointment?.appointment_date);
+    patient_name:
+      patientMap.get(appointment.patient_id)?.name ?? "",
 
-    const patient = patientMap.get(normalizeId(appointment?.patient_id));
+    phone:
+      patientMap.get(appointment.patient_id)?.phone ?? "",
 
-    const dentist = dentistMap.get(normalizeId(appointment?.dentist_id));
-
-    let queueNumber = null;
-
-    /*
-     * Cancelled appointments do not receive
-     * a queue number.
-     */
-    if (!isCancelledAppointment(appointment)) {
-      if (!queueMap[appointmentDate]) {
-        queueMap[appointmentDate] = 1;
-      }
-
-      queueNumber = queueMap[appointmentDate];
-
-      queueMap[appointmentDate] += 1;
-    }
-
-    return {
-      ...appointment,
-
-      queue_number: queueNumber,
-
-      patient_name: patient?.name ?? patient?.patient_name ?? "",
-
-      phone: patient?.phone ?? patient?.mobile ?? "",
-
-      dentist_name: dentist?.name ?? dentist?.dentist_name ?? "",
-    };
-  });
+    dentist_name:
+      dentistMap.get(appointment.dentist_id)?.name ?? "",
+  }));
 }
 
 /* ========================================================
-   Update appointment status
+   4. UPDATE APPOINTMENT STATUS
 ======================================================== */
 
-export async function updateAppointmentStatus(id, status) {
-  const normalizedAppointmentId = normalizeId(id);
-
+export async function updateAppointmentStatus(
+  id,
+  status
+) {
+  const appointmentId = normalizeId(id);
   const normalizedStatus = normalizeText(status);
 
-  if (!normalizedAppointmentId) {
-    throw appError("Appointment ID is required", 400);
+  if (!appointmentId) {
+    throw appError(
+      "Appointment ID is required",
+      400
+    );
   }
 
   if (!normalizedStatus) {
     throw appError("Status is required", 400);
   }
 
-  if (!APPOINTMENT_STATUSES.includes(normalizedStatus)) {
+  if (
+    !APPOINTMENT_STATUSES.includes(normalizedStatus)
+  ) {
     throw appError(
       `Invalid status. Use ${APPOINTMENT_STATUSES.join(", ")}`,
-      400,
+      400
     );
   }
 
-  const appointments = await readSheet("Appointments");
+  return prisma.$transaction(
+    async (tx) => {
+      await tx.$executeRaw`
+        LOCK TABLE "appointments" IN EXCLUSIVE MODE
+      `;
 
-  const index = appointments.findIndex((appointment) => {
-    return getAppointmentId(appointment) === normalizedAppointmentId;
-  });
+      const current =
+        await tx.appointment.findUnique({
+          where: {
+            id: appointmentId,
+          },
+        });
 
-  if (index === -1) {
-    throw appError("Appointment not found", 404);
-  }
+      if (!current) {
+        throw appError(
+          "Appointment not found",
+          404
+        );
+      }
 
-  const currentAppointment = appointments[index];
+      if (!current.appointmentDate) {
+        throw appError(
+          "Appointment date is required",
+          400
+        );
+      }
 
-  const currentAppointmentDate = normalizeText(
-    currentAppointment?.appointment_date ?? currentAppointment?.date,
-  );
+      // Preserve original status behavior.
+      // Transition rules were declared but not enforced.
+      const allowed =
+        ALLOWED_STATUS_TRANSITIONS[
+          normalizeText(current.status) || "Pending"
+        ];
 
-  if (!currentAppointmentDate) {
-    throw appError("Appointment date is required", 400);
-  }
+      void allowed;
 
-  const currentStatus = normalizeText(currentAppointment?.status) || "Pending";
+      if (normalizedStatus === "In Treatment") {
+        const conflict =
+          await tx.appointment.findFirst({
+            where: {
+              appointmentDate: current.appointmentDate,
+              status: "In Treatment",
+              id: {
+                not: appointmentId,
+              },
+            },
+          });
 
-  const allowedStatuses = ALLOWED_STATUS_TRANSITIONS[currentStatus];
+        if (conflict) {
+          throw appError(
+            `Another appointment is already in treatment for ${current.appointmentDate}`,
+            400
+          );
+        }
+      }
 
-  /*
-   * Only one patient may be in treatment
-   * for the selected date.
-   */
-  if (normalizedStatus === "In Treatment") {
-    const alreadyInTreatment = appointments.find((appointment) => {
-      const appointmentDate = normalizeText(
-        appointment?.appointment_date ?? appointment?.date,
-      );
+      const timestamp = getNow();
 
-      return (
-        getAppointmentId(appointment) !== normalizedAppointmentId &&
-        appointmentDate === currentAppointmentDate &&
-        normalizeText(appointment?.status) === "In Treatment"
-      );
-    });
+      const updates = {
+        status: normalizedStatus,
+        updatedAt: timestamp,
+      };
 
-    if (alreadyInTreatment) {
-      throw appError(
-        `Another appointment is already in treatment for ${currentAppointmentDate}`,
-        400,
-      );
+      if (
+        normalizedStatus === "Checked In" &&
+        !current.checkedInTime
+      ) {
+        updates.checkedInTime = timestamp;
+      }
+
+      if (
+        normalizedStatus === "In Treatment" &&
+        !current.treatmentStartedAt
+      ) {
+        updates.treatmentStartedAt = timestamp;
+      }
+
+      if (
+        normalizedStatus === "Treatment Done" &&
+        !current.treatmentCompletedAt
+      ) {
+        updates.treatmentCompletedAt = timestamp;
+      }
+
+      if (
+        normalizedStatus === "Completed" &&
+        !current.completedAt
+      ) {
+        updates.completedAt = timestamp;
+      }
+
+      const updated =
+        await tx.appointment.update({
+          where: {
+            id: appointmentId,
+          },
+          data: updates,
+        });
+
+      const waitingRecords =
+        await tx.appointment.findMany({
+          where: {
+            appointmentDate: current.appointmentDate,
+            status: "Checked In",
+            checkedInTime: {
+              not: null,
+            },
+          },
+        });
+
+      const waiting = waitingRecords
+        .filter(
+          (appointment) =>
+            Boolean(appointment.checkedInTime)
+        )
+        .sort(
+          (first, second) =>
+            new Date(
+              first.checkedInTime
+            ).getTime() -
+            new Date(
+              second.checkedInTime
+            ).getTime()
+        )
+        .map((appointment, index) => ({
+          ...mapAppointment(appointment),
+          current_queue_no: index + 1,
+        }));
+
+      return {
+        appointment: mapAppointment(updated),
+
+        queue_position:
+          waiting.find(
+            (appointment) =>
+              appointment.id === appointmentId
+          )?.current_queue_no ?? null,
+
+        waiting_queue: waiting,
+      };
+    },
+    {
+      timeout: 15000,
     }
-  }
-
-  const timestamp = getNow();
-
-  const updatedAppointment = {
-    ...currentAppointment,
-
-    status: normalizedStatus,
-
-    updated_at: timestamp,
-  };
-
-  /*
-   * Store each status timestamp only once.
-   */
-  if (
-    normalizedStatus === "Checked In" &&
-    !currentAppointment.checked_in_time
-  ) {
-    updatedAppointment.checked_in_time = timestamp;
-  }
-
-  if (
-    normalizedStatus === "In Treatment" &&
-    !currentAppointment.treatment_started_at
-  ) {
-    updatedAppointment.treatment_started_at = timestamp;
-  }
-
-  if (
-    normalizedStatus === "Treatment Done" &&
-    !currentAppointment.treatment_completed_at
-  ) {
-    updatedAppointment.treatment_completed_at = timestamp;
-  }
-
-  if (normalizedStatus === "Completed" && !currentAppointment.completed_at) {
-    updatedAppointment.completed_at = timestamp;
-  }
-
-  appointments[index] = updatedAppointment;
-
-  await writeSheet("Appointments", appointments);
-
-  /*
-   * Waiting queue includes only patients who
-   * are currently in Checked In status.
-   */
-  const waitingQueue = appointments
-    .filter((appointment) => {
-      const appointmentDate = normalizeText(
-        appointment?.appointment_date ?? appointment?.date,
-      );
-
-      return (
-        appointmentDate === currentAppointmentDate &&
-        normalizeText(appointment?.status) === "Checked In" &&
-        appointment?.checked_in_time
-      );
-    })
-    .sort((first, second) => {
-      const firstTime = new Date(first.checked_in_time).getTime();
-
-      const secondTime = new Date(second.checked_in_time).getTime();
-
-      return firstTime - secondTime;
-    })
-    .map((appointment, queueIndex) => ({
-      ...appointment,
-
-      current_queue_no: queueIndex + 1,
-    }));
-
-  const queuePosition = waitingQueue.find((appointment) => {
-    return getAppointmentId(appointment) === normalizedAppointmentId;
-  });
-
-  return {
-    appointment: updatedAppointment,
-
-    queue_position: queuePosition?.current_queue_no ?? null,
-
-    waiting_queue: waitingQueue,
-  };
+  );
 }
 
 /* ========================================================
-   Update appointment
+   5. UPDATE APPOINTMENT
 ======================================================== */
 
 export async function updateAppointment(id, data) {
-  const normalizedAppointmentId = normalizeId(id);
+  const appointmentId = normalizeId(id);
 
-  if (!normalizedAppointmentId) {
-    throw appError("Appointment ID is required", 400);
-  }
-
-  const appointments = await readSheet("Appointments");
-
-  const index = appointments.findIndex((appointment) => {
-    return getAppointmentId(appointment) === normalizedAppointmentId;
-  });
-
-  if (index === -1) {
-    throw appError("Appointment not found", 404);
+  if (!appointmentId) {
+    throw appError(
+      "Appointment ID is required",
+      400
+    );
   }
 
   if (
     data?.status &&
-    !APPOINTMENT_STATUSES.includes(normalizeText(data.status))
+    !APPOINTMENT_STATUSES.includes(
+      normalizeText(data.status)
+    )
   ) {
     throw appError(
       `Invalid status. Use ${APPOINTMENT_STATUSES.join(", ")}`,
-      400,
+      400
     );
   }
 
-  const currentAppointment = appointments[index];
+  const current =
+    await prisma.appointment.findUnique({
+      where: {
+        id: appointmentId,
+      },
+    });
 
-  appointments[index] = {
-    ...currentAppointment,
+  if (!current) {
+    throw appError(
+      "Appointment not found",
+      404
+    );
+  }
 
-    patient_id: data?.patient_id ?? currentAppointment.patient_id,
+  const updated =
+    await prisma.appointment.update({
+      where: {
+        id: appointmentId,
+      },
 
-    dentist_id: data?.dentist_id ?? currentAppointment.dentist_id,
+      data: {
+        patientId:
+          data?.patient_id == null
+            ? current.patientId
+            : normalizeId(data.patient_id),
 
-    appointment_number:
-      data?.appointment_number ?? currentAppointment.appointment_number,
+        dentistId:
+          data?.dentist_id == null
+            ? current.dentistId
+            : normalizeId(data.dentist_id),
 
-    appointment_date:
-      data?.appointment_date ?? currentAppointment.appointment_date,
+        appointmentNumber:
+          data?.appointment_number == null
+            ? current.appointmentNumber
+            : String(data.appointment_number),
 
-    appointment_time:
-      data?.appointment_time ?? currentAppointment.appointment_time,
+        appointmentDate:
+          data?.appointment_date == null
+            ? current.appointmentDate
+            : normalizeText(data.appointment_date),
 
-    reason_for_visit:
-      data?.reason_for_visit ?? currentAppointment.reason_for_visit,
+        appointmentTime:
+          data?.appointment_time == null
+            ? current.appointmentTime
+            : normalizeText(data.appointment_time),
 
-    status: data?.status ?? currentAppointment.status,
+        reasonForVisit:
+          data?.reason_for_visit == null
+            ? current.reasonForVisit
+            : normalizeText(data.reason_for_visit),
 
-    updated_at: getNow(),
-  };
+        status:
+          data?.status == null
+            ? current.status
+            : normalizeText(data.status),
 
-  await writeSheet("Appointments", appointments);
+        updatedAt: getNow(),
+      },
+    });
 
-  return appointments[index];
+  return mapAppointment(updated);
 }
 
 /* ========================================================
-   Get appointments
+   6. GET APPOINTMENTS
 ======================================================== */
 
 export async function getAppointments(date) {
-  const [appointments, patients, dentists, treatments, payments] =
-    await Promise.all([
-      readSheet("Appointments"),
-      readSheet("Patients"),
-      readSheet("Dentists"),
-      readSheet("Treatments"),
-      readSheet("Payments"),
-    ]);
+  const [
+    all,
+    [patientMap, dentistMap],
+    { treatments, payments },
+  ] = await Promise.all([
+    getAppointmentsRows(),
+    getPeopleMaps(),
+    getLegacyTreatmentData(),
+  ]);
 
-  const normalizedDate = normalizeText(date);
+  const filtered = all
+    .filter(
+      (appointment) =>
+        !normalizeText(date) ||
+        appointment.appointment_date ===
+          normalizeText(date)
+    )
+    .sort(compareAppointments);
 
-  let filteredAppointments = appointments;
+  const queue = generateQueue(filtered);
 
-  if (normalizedDate) {
-    filteredAppointments = appointments.filter((appointment) => {
-      return normalizeText(appointment?.appointment_date) === normalizedDate;
-    });
-  }
+  const treatmentMap = treatmentMapFor(treatments);
 
-  filteredAppointments = [...filteredAppointments].sort(compareAppointments);
-
-  const patientMap = new Map(
-    patients.map((patient) => [getPatientId(patient), patient]),
+  return filtered.map((appointment, index) =>
+    enrichedAppointment(
+      appointment,
+      queue[index],
+      patientMap.get(appointment.patient_id),
+      dentistMap.get(appointment.dentist_id),
+      treatmentMap.get(appointment.id),
+      payments
+    )
   );
-
-  const dentistMap = new Map(
-    dentists.map((dentist) => [getDentistId(dentist), dentist]),
-  );
-
-  const treatmentMap = new Map();
-
-  treatments.forEach((treatment) => {
-    const appointmentId = getTreatmentAppointmentId(treatment);
-
-    /*
-     * Keep the first treatment associated
-     * with an appointment.
-     */
-    if (appointmentId && !treatmentMap.has(appointmentId)) {
-      treatmentMap.set(appointmentId, treatment);
-    }
-  });
-
-  const queueMap = {};
-
-  return filteredAppointments.map((appointment) => {
-    const appointmentId = getAppointmentId(appointment);
-
-    const appointmentDate = normalizeText(appointment?.appointment_date);
-
-    const patient = patientMap.get(normalizeId(appointment?.patient_id));
-
-    const dentist = dentistMap.get(normalizeId(appointment?.dentist_id));
-
-    const treatment = treatmentMap.get(appointmentId);
-
-    const {
-      treatmentId,
-      treatmentFee,
-      treatmentPayments,
-      totalPaid,
-      remainingAmount,
-      paymentStatus,
-    } = createTreatmentPaymentData({
-      treatment,
-      payments,
-    });
-
-    let queueNumber = null;
-
-    if (!isCancelledAppointment(appointment)) {
-      if (!queueMap[appointmentDate]) {
-        queueMap[appointmentDate] = 1;
-      }
-
-      queueNumber = queueMap[appointmentDate];
-
-      queueMap[appointmentDate] += 1;
-    }
-
-    return {
-      queue_no: queueNumber,
-
-      appointment_id: appointmentId,
-
-      id: appointmentId,
-
-      patient_id: appointment?.patient_id,
-
-      patient_name: patient?.name ?? patient?.patient_name ?? "",
-
-      phone: patient?.phone ?? patient?.mobile ?? "",
-
-      age: patient?.age ?? "",
-
-      gender: patient?.gender ?? "",
-
-      address: patient?.address ?? "",
-
-      dentist_id: appointment?.dentist_id,
-
-      dentist_name: dentist?.name ?? dentist?.dentist_name ?? "",
-
-      appointment_date: appointment?.appointment_date,
-
-      appointment_time: appointment?.appointment_time,
-
-      appointment_number: appointment?.appointment_number,
-
-      checked_in_time: appointment?.checked_in_time ?? "",
-
-      treatment_started_at: appointment?.treatment_started_at ?? "",
-
-      treatment_completed_at: appointment?.treatment_completed_at ?? "",
-
-      reason_for_visit: appointment?.reason_for_visit ?? "",
-
-      status: appointment?.status ?? "",
-
-      treatment_id: treatmentId,
-
-      treatment_date: treatment?.treatment_date ?? "",
-
-      next_appointment_date: treatment?.next_appointment_date ?? "",
-
-      diagnosis: treatment?.diagnosis ?? "",
-
-      tooth_number: treatment?.tooth_number ?? "",
-
-      treatment_details:
-        treatment?.treatment_details ?? treatment?.treatment_performed ?? "",
-
-      doctor_notes: treatment?.doctor_notes ?? "",
-
-      prescription: treatment?.prescription ?? "",
-
-      treatment_fee: treatmentFee,
-
-      treatment_charge: treatmentFee,
-
-      total_paid: totalPaid,
-
-      remaining_amount: remainingAmount,
-
-      payment_status: paymentStatus,
-
-      payment_count: treatmentPayments.length,
-
-      created_at: appointment?.created_at,
-
-      updated_at: appointment?.updated_at,
-    };
-  });
 }
 
 /* ========================================================
-   Get appointment by ID
+   7. GET APPOINTMENT BY ID
 ======================================================== */
 
 export async function getAppointmentById(id) {
-  const normalizedAppointmentId = normalizeId(id);
+  const appointmentId = normalizeId(id);
 
-  if (!normalizedAppointmentId) {
-    throw appError("Appointment ID is required", 400);
+  if (!appointmentId) {
+    throw appError(
+      "Appointment ID is required",
+      400
+    );
   }
 
-  const [appointments, patients, dentists, treatments, payments] =
-    await Promise.all([
-      readSheet("Appointments"),
-      readSheet("Patients"),
-      readSheet("Dentists"),
-      readSheet("Treatments"),
-      readSheet("Payments"),
-    ]);
+  const [
+    record,
+    [patientMap, dentistMap],
+    { treatments, payments },
+  ] = await Promise.all([
+    prisma.appointment.findUnique({
+      where: {
+        id: appointmentId,
+      },
+    }),
+    getPeopleMaps(),
+    getLegacyTreatmentData(),
+  ]);
 
-  const appointment = appointments.find((item) => {
-    return getAppointmentId(item) === normalizedAppointmentId;
-  });
-
-  if (!appointment) {
-    throw appError("Appointment not found", 404);
+  if (!record) {
+    throw appError(
+      "Appointment not found",
+      404
+    );
   }
 
-  const patient = patients.find((item) => {
-    return getPatientId(item) === normalizeId(appointment?.patient_id);
-  });
+  const appointment = mapAppointment(record);
 
-  const dentist = dentists.find((item) => {
-    return getDentistId(item) === normalizeId(appointment?.dentist_id);
-  });
+  const sameDayRecords =
+    await prisma.appointment.findMany({
+      where: {
+        appointmentDate:
+          appointment.appointment_date,
+      },
+    });
 
-  const treatment = treatments.find((item) => {
-    return getTreatmentAppointmentId(item) === normalizedAppointmentId;
-  });
-
-  const {
-    treatmentId,
-    treatmentFee,
-    treatmentPayments,
-    totalPaid,
-    remainingAmount,
-    paymentStatus,
-  } = createTreatmentPaymentData({
-    treatment,
-    payments,
-  });
-
-  const sameDayAppointments = appointments
-    .filter((item) => {
-      return (
-        normalizeText(item?.appointment_date) ===
-          normalizeText(appointment?.appointment_date) &&
+  const sameDay = sameDayRecords
+    .map(mapAppointment)
+    .filter(
+      (item) =>
         !isCancelledAppointment(item)
-      );
-    })
+    )
     .sort(compareAppointments);
 
-  const queueIndex = sameDayAppointments.findIndex((item) => {
-    return getAppointmentId(item) === normalizedAppointmentId;
-  });
+  const queueIndex = sameDay.findIndex(
+    (item) => item.id === appointment.id
+  );
 
-  return {
-    appointment_id: normalizedAppointmentId,
+  const treatment = treatments.find(
+    (item) =>
+      getTreatmentAppointmentId(item) ===
+      appointment.id
+  );
 
-    id: normalizedAppointmentId,
+  return enrichedAppointment(
+    appointment,
 
-    queue_no: isCancelledAppointment(appointment)
+    isCancelledAppointment(appointment)
       ? null
       : queueIndex >= 0
         ? queueIndex + 1
         : null,
 
-    patient_id: appointment?.patient_id,
-
-    patient_name: patient?.name ?? patient?.patient_name ?? "",
-
-    phone: patient?.phone ?? patient?.mobile ?? "",
-
-    age: patient?.age ?? "",
-
-    gender: patient?.gender ?? "",
-
-    address: patient?.address ?? "",
-
-    dentist_id: appointment?.dentist_id,
-
-    dentist_name: dentist?.name ?? dentist?.dentist_name ?? "",
-
-    appointment_date: appointment?.appointment_date,
-
-    appointment_time: appointment?.appointment_time,
-
-    appointment_number: appointment?.appointment_number,
-
-    checked_in_time: appointment?.checked_in_time ?? "",
-
-    treatment_started_at: appointment?.treatment_started_at ?? "",
-
-    treatment_completed_at: appointment?.treatment_completed_at ?? "",
-
-    completed_at: appointment?.completed_at ?? "",
-
-    reason_for_visit: appointment?.reason_for_visit ?? "",
-
-    status: appointment?.status ?? "",
-
-    treatment_id: treatmentId,
-
-    treatment_date: treatment?.treatment_date ?? "",
-
-    next_appointment_date: treatment?.next_appointment_date ?? "",
-
-    diagnosis: treatment?.diagnosis ?? "",
-
-    tooth_number: treatment?.tooth_number ?? "",
-
-    treatment_details:
-      treatment?.treatment_details ?? treatment?.treatment_performed ?? "",
-
-    doctor_notes: treatment?.doctor_notes ?? "",
-
-    prescription: treatment?.prescription ?? "",
-
-    treatment_fee: treatmentFee,
-
-    treatment_charge: treatmentFee,
-
-    total_paid: totalPaid,
-
-    remaining_amount: remainingAmount,
-
-    payment_status: paymentStatus,
-
-    payment_count: treatmentPayments.length,
-
-    payments: treatmentPayments,
-
-    created_at: appointment?.created_at,
-
-    updated_at: appointment?.updated_at,
-  };
+    patientMap.get(appointment.patient_id),
+    dentistMap.get(appointment.dentist_id),
+    treatment,
+    payments,
+    true
+  );
 }
 
 /* ========================================================
-   Get appointments by date range
+   8. GET APPOINTMENTS BY DATE RANGE
 ======================================================== */
 
-export async function getAppointmentsByDateRange(startDate, endDate) {
+export async function getAppointmentsByDateRange(
+  startDate,
+  endDate
+) {
   if (!startDate || !endDate) {
-    throw appError("Start date and end date are required", 400);
+    throw appError(
+      "Start date and end date are required",
+      400
+    );
   }
 
-  const appointments = await readSheet("Appointments");
+  const records =
+    await prisma.appointment.findMany({
+      where: {
+        appointmentDate: {
+          gte: startDate,
+          lte: endDate,
+        },
+      },
+    });
 
-  return filterByDateRange(
-    appointments,
-    "appointment_date",
-    startDate,
-    endDate,
-  ).sort(compareAppointments);
+  return records
+    .map(mapAppointment)
+    .sort(compareAppointments);
 }
 
 /* ========================================================
-   Get full appointment details
+   9. GET FULL APPOINTMENT DETAILS
 ======================================================== */
 
-export async function getAppointmentFullDetailsService(appointmentId) {
-  const normalizedAppointmentId = normalizeId(appointmentId);
+export async function getAppointmentFullDetailsService(
+  appointmentId
+) {
+  const id = normalizeId(appointmentId);
 
-  if (!normalizedAppointmentId) {
-    throw appError("Appointment ID is required", 400);
+  if (!id) {
+    throw appError(
+      "Appointment ID is required",
+      400
+    );
   }
 
-  const [appointments, patients, dentists, treatments, payments] =
-    await Promise.all([
-      readSheet("Appointments"),
-      readSheet("Patients"),
-      readSheet("Dentists"),
-      readSheet("Treatments"),
-      readSheet("Payments"),
-    ]);
+  const [
+    record,
+    { treatments, payments },
+  ] = await Promise.all([
+    prisma.appointment.findUnique({
+      where: { id },
+    }),
+    getLegacyTreatmentData(),
+  ]);
 
-  const appointment = appointments.find((item) => {
-    return getAppointmentId(item) === normalizedAppointmentId;
-  });
-
-  if (!appointment) {
-    throw appError("Appointment not found", 404);
+  if (!record) {
+    throw appError(
+      "Appointment not found",
+      404
+    );
   }
 
-  const patient =
-    patients.find((item) => {
-      return getPatientId(item) === normalizeId(appointment?.patient_id);
-    }) ?? null;
+  const appointment = mapAppointment(record);
 
-  const dentist =
-    dentists.find((item) => {
-      return getDentistId(item) === normalizeId(appointment?.dentist_id);
-    }) ?? null;
+  const [patient, dentist] = await Promise.all([
+    appointment.patient_id
+      ? prisma.patient.findUnique({
+          where: {
+            id: appointment.patient_id,
+          },
+        })
+      : null,
 
-  const appointmentTreatments = treatments.filter((item) => {
-    return getTreatmentAppointmentId(item) === normalizedAppointmentId;
-  });
+    appointment.dentist_id
+      ? prisma.dentist.findUnique({
+          where: {
+            id: appointment.dentist_id,
+          },
+        })
+      : null,
+  ]);
+
+  const appointmentTreatments =
+    treatments.filter(
+      (treatment) =>
+        getTreatmentAppointmentId(treatment) === id
+    );
 
   const treatmentIds = appointmentTreatments
     .map(getTreatmentId)
     .filter(Boolean);
 
-  const appointmentPayments = payments.filter((payment) => {
-    const paymentAppointmentId = normalizeId(payment?.appointment_id);
-
-    const paymentTreatmentId = normalizeId(payment?.treatment_id);
-
-    return (
-      paymentAppointmentId === normalizedAppointmentId ||
-      treatmentIds.includes(paymentTreatmentId)
-    );
-  });
-
-  /*
-   * Calculate treatment charge from Treatments.
-   * This prevents duplicate treatment charges when
-   * one treatment has multiple payment installments.
-   */
-  const totalTreatmentCharge = appointmentTreatments.reduce(
-    (total, treatment) => {
-      return (
-        total +
-        toNumber(treatment?.treatment_fee ?? treatment?.treatment_charge)
-      );
-    },
-    0,
+  const appointmentPayments = payments.filter(
+    (payment) =>
+      normalizeId(payment?.appointment_id) === id ||
+      treatmentIds.includes(
+        normalizeId(payment?.treatment_id)
+      )
   );
 
-  const totalPaid = appointmentPayments.reduce((total, payment) => {
-    return total + toNumber(payment?.payment_amount ?? payment?.amount);
-  }, 0);
+  const totalTreatmentCharge =
+    appointmentTreatments.reduce(
+      (sum, treatment) =>
+        sum +
+        toNumber(
+          treatment?.treatment_fee ??
+          treatment?.treatment_charge
+        ),
+      0
+    );
 
-  const balance = Math.max(totalTreatmentCharge - totalPaid, 0);
+  const totalPaid = appointmentPayments.reduce(
+    (sum, payment) =>
+      sum +
+      toNumber(
+        payment?.payment_amount ??
+        payment?.amount
+      ),
+    0
+  );
 
-  let paymentStatus = "Unpaid";
-
-  if (totalTreatmentCharge > 0 && totalPaid >= totalTreatmentCharge) {
-    paymentStatus = "Paid";
-  } else if (totalPaid > 0) {
-    paymentStatus = "Partial";
-  }
+  const paymentStatus =
+    totalTreatmentCharge > 0 &&
+    totalPaid >= totalTreatmentCharge
+      ? "Paid"
+      : totalPaid > 0
+        ? "Partial"
+        : "Unpaid";
 
   return {
     appointment,
-    patient,
-    dentist,
+
+    patient: patient
+      ? {
+          id: patient.id,
+          name: patient.name ?? "",
+          phone: patient.phone ?? "",
+          age: patient.age ?? "",
+          gender: patient.gender ?? "",
+          address: patient.address ?? "",
+          is_allergies: patient.isAllergies ?? "",
+          allergies: patient.allergies ?? "",
+          location: patient.location ?? "",
+          distance: patient.distance ?? "",
+          created_at: patient.createdAt ?? "",
+          updated_at: patient.updatedAt ?? "",
+        }
+      : null,
+
+    dentist: dentist
+      ? {
+          id: dentist.id,
+          name: dentist.name ?? "",
+          phone: dentist.phone ?? "",
+          specialization:
+            dentist.specialization ?? "",
+          created_at: dentist.createdAt ?? "",
+          updated_at: dentist.updatedAt ?? "",
+        }
+      : null,
 
     treatments: appointmentTreatments,
-
     payments: appointmentPayments,
 
     payment_summary: {
-      total_treatment_charge: totalTreatmentCharge,
-
+      total_treatment_charge:
+        totalTreatmentCharge,
       total_paid: totalPaid,
 
-      balance,
+      balance: Math.max(
+        totalTreatmentCharge - totalPaid,
+        0
+      ),
 
       payment_status: paymentStatus,
     },
@@ -1388,53 +1348,69 @@ export async function getAppointmentFullDetailsService(appointmentId) {
 }
 
 /* ========================================================
-   Get appointment using treatment ID
+   10. GET APPOINTMENT BY TREATMENT ID
 ======================================================== */
 
-export async function getAppointmentByTreatmentId({ treatmentId }) {
-  const normalizedTreatmentId = normalizeId(treatmentId);
+export async function getAppointmentByTreatmentId({
+  treatmentId,
+}) {
+  const id = normalizeId(treatmentId);
 
-  if (normalizedTreatmentId) {
-    const [appointments, treatments] = await Promise.all([
-      readSheet("Appointments"),
-      readSheet("Treatments"),
-    ]);
+  if (id) {
+    const treatments =
+      await readSheet("Treatments");
 
-    const treatment = treatments.find((item) => {
-      return getTreatmentId(item) === normalizedTreatmentId;
-    });
+    const treatment = treatments.find(
+      (item) =>
+        getTreatmentId(item) === id
+    );
 
     if (!treatment) {
-      throw appError("Treatment not found", 404);
+      throw appError(
+        "Treatment not found",
+        404
+      );
     }
 
-    const appointmentId = getTreatmentAppointmentId(treatment);
+    const appointmentId =
+      getTreatmentAppointmentId(treatment);
 
     if (!appointmentId) {
-      throw appError("Appointment ID is not available for this treatment", 404);
+      throw appError(
+        "Appointment ID is not available for this treatment",
+        404
+      );
     }
 
-    const appointment = appointments.find((item) => {
-      return getAppointmentId(item) === appointmentId;
-    });
+    const appointment =
+      await prisma.appointment.findUnique({
+        where: {
+          id: appointmentId,
+        },
+      });
 
     if (!appointment) {
-      throw appError("Appointment not found for this treatment", 404);
+      throw appError(
+        "Appointment not found for this treatment",
+        404
+      );
     }
 
     return {
       type: "single",
-      data: appointment,
+      data: mapAppointment(appointment),
     };
   }
 
-  const appointments = await readSheet("Appointments");
-
-  const sortedAppointments = [...appointments].sort(compareAppointments);
+  const appointments = (
+    await prisma.appointment.findMany()
+  )
+    .map(mapAppointment)
+    .sort(compareAppointments);
 
   return {
     type: "list",
-    data: sortedAppointments,
-    total: sortedAppointments.length,
+    data: appointments,
+    total: appointments.length,
   };
 }

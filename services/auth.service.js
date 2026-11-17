@@ -1,14 +1,14 @@
+
 import bcrypt from "bcryptjs";
 import crypto from "crypto";
 
-import {
-  readSheet,
-  writeSheet,
-} from "../utils/googleSheets.js";
+import prisma from "../config/prisma.js";
 
 import { generateToken } from "../utils/token.js";
 
-const USERS_SHEET = "Users";
+/* ========================================================
+   CONFIGURATION
+======================================================== */
 
 const ALLOWED_ROLES = [
   "Admin",
@@ -17,8 +17,10 @@ const ALLOWED_ROLES = [
   "Receptionist",
 ];
 
+const BCRYPT_PATTERN = /^\$2[aby]\$\d{2}\$/;
+
 /* ========================================================
-   General helpers
+   GENERAL HELPERS
 ======================================================== */
 
 const createError = (
@@ -26,140 +28,149 @@ const createError = (
   statusCode = 400,
 ) => {
   const error = new Error(message);
-
   error.statusCode = statusCode;
-
   return error;
 };
 
-const normalizeText = (value) => {
-  return String(value ?? "")
-    .trim()
-    .toLowerCase();
-};
+const normalizeText = (value) =>
+  String(value ?? "").trim().toLowerCase();
 
-const normalizeEmail = (email = "") => {
-  return String(email)
-    .trim()
-    .toLowerCase();
-};
+const normalizeEmail = (value) =>
+  String(value ?? "").trim().toLowerCase();
 
-const normalizeUsername = (username = "") => {
-  return String(username)
-    .trim()
-    .toLowerCase();
-};
+const normalizeUsername = (value) =>
+  String(value ?? "").trim().toLowerCase();
 
-const getNow = () => {
-  return new Date().toISOString();
-};
+const getNow = () => new Date().toISOString();
 
-const generateUserId = () => {
-  const randomPart = crypto
-    .randomBytes(4)
-    .toString("hex");
+const generateUserId = () =>
+  `USR_${crypto.randomBytes(8).toString("hex")}`;
 
-  return `USR_${randomPart}`;
-};
+const isBcryptHash = (value) =>
+  BCRYPT_PATTERN.test(String(value ?? ""));
+
+/* ========================================================
+   USER RESPONSE MAPPER
+======================================================== */
 
 const sanitizeUser = (user) => {
-  if (!user) {
-    return null;
-  }
+  if (!user) return null;
 
   return {
     id: user.id,
-    name: user.name,
-    email: user.email,
-    username: user.username,
-    phone: user.phone,
-    role: user.role,
-    status: user.status,
 
-    // Permissions from Google Sheet
-    queue_manager: user.queue_manager,
-    appointment_history: user.appointment_history,
-    doctor_treatment: user.doctor_treatment,
-    payment_history: user.payment_history,
-    common_treatments: user.common_treatments,
-    drugs: user.drugs,
-    locations: user.locations,
+    name: user.name ?? "",
+    email: user.email ?? "",
+    username: user.username ?? "",
+    phone: user.phone ?? "",
 
-    created_at: user.created_at,
-    updated_at: user.updated_at,
+    role: user.role ?? "",
+    status: user.status ?? "",
+
+    queue_manager: user.queueManager ?? "",
+    appointment_history:
+      user.appointmentHistory ?? "",
+    doctor_treatment:
+      user.doctorTreatment ?? "",
+    payment_history:
+      user.paymentHistory ?? "",
+    common_treatments:
+      user.commonTreatments ?? "",
+    drugs: user.drugs ?? "",
+    locations: user.locations ?? "",
+
+    created_at: user.createdAt ?? "",
+    updated_at: user.updatedAt ?? "",
   };
 };
 
 /* ========================================================
-   User lookup helpers
+   USER LOOKUP HELPERS
 ======================================================== */
 
-const findUserByUsername = async (
-  username,
-) => {
-  const users =
-    await readSheet(USERS_SHEET);
-
+const findUserByUsername = async (username) => {
   const normalizedUsername =
     normalizeUsername(username);
 
-  return users.find((user) => {
-    return (
-      normalizeUsername(user?.username) ===
-      normalizedUsername
-    );
+  if (!normalizedUsername) return null;
+
+  return prisma.user.findFirst({
+    where: {
+      username: {
+        equals: normalizedUsername,
+        mode: "insensitive",
+      },
+    },
   });
 };
 
 const findUserById = async (userId) => {
-  const users =
-    await readSheet(USERS_SHEET);
-
-  const normalizedUserId = String(
+  const normalizedId = String(
     userId ?? "",
   ).trim();
 
-  return users.find((user) => {
-    return (
-      String(user?.id ?? "").trim() ===
-      normalizedUserId
-    );
+  if (!normalizedId) return null;
+
+  return prisma.user.findUnique({
+    where: {
+      id: normalizedId,
+    },
   });
 };
 
 /* ========================================================
-   User status validation
+   USER STATUS VALIDATION
 ======================================================== */
 
 const validateUserStatus = (user) => {
   const status = normalizeText(user?.status);
 
-  /*
-   * An empty status or any status other than Active
-   * prevents login and authenticated access.
-   */
+  if (status !== "active") {
+    throw createError(
+      "Your account is inactive. Please contact the administrator.",
+      403,
+    );
+  }
 };
 
 /* ========================================================
-   Login
+   PASSWORD HASH HELPER
+======================================================== */
+
+export const hashPassword = async (password) => {
+  const passwordValue = String(password ?? "");
+
+  if (passwordValue.length < 6) {
+    throw createError(
+      "Password must contain at least 6 characters.",
+      400,
+    );
+  }
+
+  return bcrypt.hash(passwordValue, 12);
+};
+
+/* ========================================================
+   LOGIN
 ======================================================== */
 
 export const loginUser = async ({
   username,
   password,
 }) => {
-  if (
-    !normalizeUsername(username) ||
-    !password
-  ) {
+  const normalizedUsername =
+    normalizeUsername(username);
+
+  if (!normalizedUsername || !password) {
     throw createError(
       "Username and password are required.",
       400,
     );
   }
 
-  const user =
-    await findUserByUsername(username);
+  const user = await findUserByUsername(
+    normalizedUsername,
+  );
 
   if (!user) {
     throw createError(
@@ -168,29 +179,28 @@ export const loginUser = async ({
     );
   }
 
-  validateUserStatus(user);
-
   /*
-   * password_hash is the recommended field.
-   * password is retained as a compatibility fallback
-   * for users already saved in the old Excel database.
+   * Support existing bcrypt hashes in either
+   * passwordHash or legacy password.
+   *
+   * Never authenticate against plaintext values.
    */
-  const passwordHash =
-    user.password_hash ||
-    user.password;
+  const storedHash = [
+    user.passwordHash,
+    user.password,
+  ].find(isBcryptHash);
 
-  if (!passwordHash) {
+  if (!storedHash) {
     throw createError(
-      "The user account does not have a password configured.",
+      "The user account does not have a valid password hash configured.",
       500,
     );
   }
 
-  const passwordMatches =
-    await bcrypt.compare(
-      String(password),
-      String(passwordHash),
-    );
+  const passwordMatches = await bcrypt.compare(
+    String(password),
+    storedHash,
+  );
 
   if (!passwordMatches) {
     throw createError(
@@ -198,6 +208,8 @@ export const loginUser = async ({
       401,
     );
   }
+
+  validateUserStatus(user);
 
   const token = generateToken({
     userId: user.id,
@@ -212,21 +224,26 @@ export const loginUser = async ({
 };
 
 /* ========================================================
-   Get authenticated user
+   GET AUTHENTICATED USER
 ======================================================== */
 
 export const getAuthenticatedUser = async (
   userId,
 ) => {
-  if (!String(userId ?? "").trim()) {
+  const normalizedId = String(
+    userId ?? "",
+  ).trim();
+
+  if (!normalizedId) {
     throw createError(
       "User ID is required.",
       400,
     );
   }
 
-  const user =
-    await findUserById(userId);
+  const user = await findUserById(
+    normalizedId,
+  );
 
   if (!user) {
     throw createError(
@@ -241,30 +258,7 @@ export const getAuthenticatedUser = async (
 };
 
 /* ========================================================
-   Hash password
-======================================================== */
-
-export const hashPassword = async (
-  password,
-) => {
-  const passwordValue =
-    String(password ?? "");
-
-  if (passwordValue.length < 6) {
-    throw createError(
-      "Password must contain at least 6 characters.",
-      400,
-    );
-  }
-
-  return bcrypt.hash(
-    passwordValue,
-    12,
-  );
-};
-
-/* ========================================================
-   Register user
+   REGISTER USER
 ======================================================== */
 
 export const registerUser = async (
@@ -279,8 +273,9 @@ export const registerUser = async (
     role = "Receptionist",
   } = data;
 
-  const formattedName =
-    String(name ?? "").trim();
+  const formattedName = String(
+    name ?? "",
+  ).trim();
 
   const formattedEmail =
     normalizeEmail(email);
@@ -288,11 +283,17 @@ export const registerUser = async (
   const formattedUsername =
     normalizeUsername(username);
 
-  const passwordValue =
-    String(password ?? "");
+  const passwordValue = String(
+    password ?? "",
+  );
 
-  const formattedRole =
-    String(role ?? "").trim();
+  const formattedRole = String(
+    role ?? "",
+  ).trim();
+
+  /* --------------------------------------------------------
+     VALIDATION
+  -------------------------------------------------------- */
 
   if (!formattedName) {
     throw createError(
@@ -329,29 +330,43 @@ export const registerUser = async (
     );
   }
 
-  if (
-    !ALLOWED_ROLES.includes(
-      formattedRole,
-    )
-  ) {
+  if (!ALLOWED_ROLES.includes(formattedRole)) {
     throw createError(
-      `Invalid user role. Use ${ALLOWED_ROLES.join(
-        ", ",
-      )}`,
+      `Invalid user role. Use ${ALLOWED_ROLES.join(", ")}`,
       400,
     );
   }
 
-  const users =
-    await readSheet(USERS_SHEET);
+  /* --------------------------------------------------------
+     CHECK DUPLICATES
+  -------------------------------------------------------- */
 
-  const emailExists =
-    users.some((user) => {
-      return (
-        normalizeEmail(user?.email) ===
-        formattedEmail
-      );
-    });
+  const [emailExists, usernameExists] =
+    await Promise.all([
+      prisma.user.findFirst({
+        where: {
+          email: {
+            equals: formattedEmail,
+            mode: "insensitive",
+          },
+        },
+        select: {
+          id: true,
+        },
+      }),
+
+      prisma.user.findFirst({
+        where: {
+          username: {
+            equals: formattedUsername,
+            mode: "insensitive",
+          },
+        },
+        select: {
+          id: true,
+        },
+      }),
+    ]);
 
   if (emailExists) {
     throw createError(
@@ -360,15 +375,6 @@ export const registerUser = async (
     );
   }
 
-  const usernameExists =
-    users.some((user) => {
-      return (
-        normalizeUsername(
-          user?.username,
-        ) === formattedUsername
-      );
-    });
-
   if (usernameExists) {
     throw createError(
       "Username is already registered",
@@ -376,51 +382,61 @@ export const registerUser = async (
     );
   }
 
-  const passwordHash =
-    await hashPassword(passwordValue);
+  /* --------------------------------------------------------
+     HASH PASSWORD
+  -------------------------------------------------------- */
+
+  const passwordHash = await hashPassword(
+    passwordValue,
+  );
 
   const timestamp = getNow();
 
-  const newUser = {
-    id: generateUserId(),
+  /* --------------------------------------------------------
+     CREATE USER
+  -------------------------------------------------------- */
 
-    name:
-      formattedName,
+  try {
+    const user = await prisma.user.create({
+      data: {
+        id: generateUserId(),
 
-    email:
-      formattedEmail,
+        name: formattedName,
+        email: formattedEmail,
+        username: formattedUsername,
+        phone: String(phone ?? "").trim(),
 
-    username:
-      formattedUsername,
+        passwordHash,
+        password: null,
 
-    phone:
-      String(phone ?? "").trim(),
+        role: formattedRole,
+        status: "Active",
 
-    password_hash:
-      passwordHash,
+        createdAt: timestamp,
+        updatedAt: timestamp,
+      },
+    });
 
-    role:
-      formattedRole,
+    return sanitizeUser(user);
+  } catch (error) {
+    /*
+     * Handles uniqueness errors if database
+     * unique constraints are added.
+     */
+    if (error?.code === "P2002") {
+      throw createError(
+        "Username or email is already registered",
+        409,
+      );
+    }
 
-    status:
-      "Active",
-
-    created_at:
-      timestamp,
-
-    updated_at:
-      timestamp,
-  };
-
-  users.push(newUser);
-
-  await writeSheet(
-    USERS_SHEET,
-    users,
-  );
-
-  return sanitizeUser(newUser);
+    throw error;
+  }
 };
+
+/* ========================================================
+   EXPORT
+======================================================== */
 
 export default {
   loginUser,

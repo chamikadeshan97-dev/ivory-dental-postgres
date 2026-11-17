@@ -1,20 +1,13 @@
-import {
-  readSheet,
-  writeSheet,
-} from "../utils/googleSheets.js";
 
-import {
-  createId,
-  now,
-} from "../utils/helpers.js";
+import prisma from "../config/prisma.js";
+
+import { createId, now } from "../utils/helpers.js";
 
 import appError from "../utils/appError.js";
 
-const SHEET_NAME = "Common_Treatments";
-
-/* --------------------------------------------------------
-   Helpers
--------------------------------------------------------- */
+/* ========================================================
+   HELPERS
+======================================================== */
 
 function normalizeText(value) {
   return String(value ?? "").trim();
@@ -29,14 +22,10 @@ function normalizeTreatmentNameForComparison(value) {
 }
 
 function validateTreatmentName(value) {
-  const treatmentName =
-    normalizeTreatmentName(value);
+  const treatmentName = normalizeTreatmentName(value);
 
   if (!treatmentName) {
-    throw appError(
-      "Treatment name is required",
-      400,
-    );
+    throw appError("Treatment name is required", 400);
   }
 
   if (treatmentName.length > 150) {
@@ -55,10 +44,7 @@ function validateFee(value) {
     value === null ||
     value === ""
   ) {
-    throw appError(
-      "Treatment fee is required",
-      400,
-    );
+    throw appError("Treatment fee is required", 400);
   }
 
   const fee = Number(value);
@@ -80,75 +66,61 @@ function validateFee(value) {
   return Number(fee.toFixed(2));
 }
 
+/* ========================================================
+   PRISMA RESPONSE MAPPER
+======================================================== */
+
 function normalizeTreatment(record) {
+  if (!record) return null;
+
   return {
-    id: normalizeText(record?.id),
+    id: normalizeText(record.id),
 
-    treatment_name:
-      normalizeTreatmentName(
-        record?.treatment_name,
-      ),
+    treatment_name: normalizeTreatmentName(
+      record.treatmentName,
+    ),
 
-    fee: Number(record?.fee || 0),
+    fee: Number(record.fee ?? 0),
 
-    created_at:
-      normalizeText(record?.created_at),
+    created_at: normalizeText(record.createdAt),
 
-    updated_at:
-      normalizeText(record?.updated_at),
+    updated_at: normalizeText(record.updatedAt),
   };
 }
 
 function sortTreatmentsByName(treatments) {
-  return [...treatments].sort(
-    (first, second) =>
-      first.treatment_name.localeCompare(
-        second.treatment_name,
-        undefined,
-        {
-          sensitivity: "base",
-        },
-      ),
+  return [...treatments].sort((first, second) =>
+    first.treatment_name.localeCompare(
+      second.treatment_name,
+      undefined,
+      {
+        sensitivity: "base",
+      },
+    ),
   );
 }
 
-/*
- * Google Sheets operations are asynchronous,
- * so this helper must also be asynchronous.
- */
-async function getAllTreatmentRows() {
-  const rows = await readSheet(SHEET_NAME);
+/* ========================================================
+   DATABASE HELPERS
+======================================================== */
 
-  if (!Array.isArray(rows)) {
-    return [];
-  }
+async function getAllTreatmentRows(db = prisma) {
+  const records = await db.commonTreatment.findMany();
 
-  return rows
-    .filter(
-      (row) =>
-        row &&
-        typeof row === "object",
-    )
+  return records
     .map(normalizeTreatment)
-    .filter(
-      (treatment) =>
-        Boolean(treatment.id),
-    );
+    .filter((treatment) => Boolean(treatment?.id));
 }
 
-function findTreatmentIndexById(
-  treatments,
-  id,
-) {
-  const normalizedId =
-    normalizeText(id).toLowerCase();
-
-  return treatments.findIndex(
-    (treatment) =>
-      normalizeText(
-        treatment.id,
-      ).toLowerCase() === normalizedId,
-  );
+async function findTreatmentById(id, db = prisma) {
+  return db.commonTreatment.findFirst({
+    where: {
+      id: {
+        equals: normalizeText(id),
+        mode: "insensitive",
+      },
+    },
+  });
 }
 
 function findDuplicateTreatment(
@@ -157,175 +129,133 @@ function findDuplicateTreatment(
   ignoredId = null,
 ) {
   const normalizedName =
-    normalizeTreatmentNameForComparison(
-      treatmentName,
-    );
+    normalizeTreatmentNameForComparison(treatmentName);
 
-  const normalizedIgnoredId =
-    ignoredId
-      ? normalizeText(
-          ignoredId,
-        ).toLowerCase()
-      : null;
+  const normalizedIgnoredId = ignoredId
+    ? normalizeText(ignoredId).toLowerCase()
+    : null;
 
-  return treatments.find(
-    (treatment) => {
-      const hasSameName =
-        normalizeTreatmentNameForComparison(
-          treatment.treatment_name,
-        ) === normalizedName;
+  return treatments.find((treatment) => {
+    const hasSameName =
+      normalizeTreatmentNameForComparison(
+        treatment.treatment_name,
+      ) === normalizedName;
 
-      const isIgnoredTreatment =
-        normalizedIgnoredId &&
-        normalizeText(
-          treatment.id,
-        ).toLowerCase() ===
-          normalizedIgnoredId;
+    const isIgnoredTreatment =
+      normalizedIgnoredId &&
+      normalizeText(treatment.id).toLowerCase() ===
+        normalizedIgnoredId;
 
-      return (
-        hasSameName &&
-        !isIgnoredTreatment
+    return hasSameName && !isIgnoredTreatment;
+  });
+}
+
+/* ========================================================
+   1. CREATE COMMON TREATMENT
+======================================================== */
+
+export async function createCommonTreatment(data) {
+  const treatmentName = validateTreatmentName(
+    data?.treatment_name,
+  );
+
+  const fee = validateFee(data?.fee);
+
+  return prisma.$transaction(
+    async (tx) => {
+      // Serialize treatment creation and duplicate checks.
+      await tx.$executeRaw`
+        LOCK TABLE "common_treatments" IN EXCLUSIVE MODE
+      `;
+
+      const treatments = await getAllTreatmentRows(tx);
+
+      const duplicateTreatment = findDuplicateTreatment(
+        treatments,
+        treatmentName,
       );
+
+      if (duplicateTreatment) {
+        throw appError(
+          "A common treatment with this name already exists",
+          409,
+        );
+      }
+
+      const timestamp = now();
+
+      const created = await tx.commonTreatment.create({
+        data: {
+          id: createId("CT"),
+          treatmentName,
+          fee,
+          createdAt: timestamp,
+          updatedAt: timestamp,
+        },
+      });
+
+      return normalizeTreatment(created);
+    },
+    {
+      timeout: 15000,
     },
   );
 }
 
-/* --------------------------------------------------------
-   Create
--------------------------------------------------------- */
-
-export async function createCommonTreatment(
-  data,
-) {
-  const treatments =
-    await getAllTreatmentRows();
-
-  const treatmentName =
-    validateTreatmentName(
-      data?.treatment_name,
-    );
-
-  const fee =
-    validateFee(data?.fee);
-
-  const duplicateTreatment =
-    findDuplicateTreatment(
-      treatments,
-      treatmentName,
-    );
-
-  if (duplicateTreatment) {
-    throw appError(
-      "A common treatment with this name already exists",
-      409,
-    );
-  }
-
-  const timestamp = now();
-
-  const newTreatment = {
-    id: createId("CT"),
-
-    treatment_name:
-      treatmentName,
-
-    fee,
-
-    created_at:
-      timestamp,
-
-    updated_at:
-      timestamp,
-  };
-
-  treatments.push(newTreatment);
-
-  await writeSheet(
-    SHEET_NAME,
-    treatments,
-  );
-
-  return newTreatment;
-}
-
-/* --------------------------------------------------------
-   Read all
--------------------------------------------------------- */
+/* ========================================================
+   2. GET ALL COMMON TREATMENTS
+======================================================== */
 
 export async function getAllCommonTreatments() {
-  const treatments =
-    await getAllTreatmentRows();
+  const treatments = await getAllTreatmentRows();
 
-  return sortTreatmentsByName(
-    treatments,
-  );
+  return sortTreatmentsByName(treatments);
 }
 
-/* --------------------------------------------------------
-   Search
--------------------------------------------------------- */
+/* ========================================================
+   3. SEARCH COMMON TREATMENTS
+======================================================== */
 
-export async function searchCommonTreatments(
-  q,
-) {
-  const treatments =
-    await getAllTreatmentRows();
+export async function searchCommonTreatments(q) {
+  const treatments = await getAllTreatmentRows();
 
-  const searchValue =
-    normalizeText(q).toLowerCase();
+  const searchValue = normalizeText(q).toLowerCase();
 
   if (!searchValue) {
-    return sortTreatmentsByName(
-      treatments,
-    );
+    return sortTreatmentsByName(treatments);
   }
 
-  const filteredTreatments =
-    treatments.filter(
-      (treatment) => {
-        const treatmentId =
-          normalizeText(
-            treatment.id,
-          ).toLowerCase();
+  const filteredTreatments = treatments.filter(
+    (treatment) => {
+      const treatmentId = normalizeText(
+        treatment.id,
+      ).toLowerCase();
 
-        const treatmentName =
-          normalizeText(
-            treatment.treatment_name,
-          ).toLowerCase();
+      const treatmentName = normalizeText(
+        treatment.treatment_name,
+      ).toLowerCase();
 
-        const treatmentFee =
-          String(
-            treatment.fee,
-          ).toLowerCase();
+      const treatmentFee = String(
+        treatment.fee,
+      ).toLowerCase();
 
-        return (
-          treatmentId.includes(
-            searchValue,
-          ) ||
-          treatmentName.includes(
-            searchValue,
-          ) ||
-          treatmentFee.includes(
-            searchValue,
-          )
-        );
-      },
-    );
-
-  return sortTreatmentsByName(
-    filteredTreatments,
+      return (
+        treatmentId.includes(searchValue) ||
+        treatmentName.includes(searchValue) ||
+        treatmentFee.includes(searchValue)
+      );
+    },
   );
+
+  return sortTreatmentsByName(filteredTreatments);
 }
 
-/* --------------------------------------------------------
-   Read by ID
--------------------------------------------------------- */
+/* ========================================================
+   4. GET COMMON TREATMENT BY ID
+======================================================== */
 
-export async function getCommonTreatmentById(
-  id,
-) {
-  const normalizedId =
-    normalizeText(id);
+export async function getCommonTreatmentById(id) {
+  const normalizedId = normalizeText(id);
 
   if (!normalizedId) {
     throw appError(
@@ -334,17 +264,7 @@ export async function getCommonTreatmentById(
     );
   }
 
-  const treatments =
-    await getAllTreatmentRows();
-
-  const treatment =
-    treatments.find(
-      (item) =>
-        normalizeText(
-          item.id,
-        ).toLowerCase() ===
-        normalizedId.toLowerCase(),
-    );
+  const treatment = await findTreatmentById(normalizedId);
 
   if (!treatment) {
     throw appError(
@@ -353,19 +273,15 @@ export async function getCommonTreatmentById(
     );
   }
 
-  return treatment;
+  return normalizeTreatment(treatment);
 }
 
-/* --------------------------------------------------------
-   Update
--------------------------------------------------------- */
+/* ========================================================
+   5. UPDATE COMMON TREATMENT
+======================================================== */
 
-export async function updateCommonTreatment(
-  id,
-  data,
-) {
-  const normalizedId =
-    normalizeText(id);
+export async function updateCommonTreatment(id, data) {
+  const normalizedId = normalizeText(id);
 
   if (!normalizedId) {
     throw appError(
@@ -374,99 +290,90 @@ export async function updateCommonTreatment(
     );
   }
 
-  const treatments =
-    await getAllTreatmentRows();
+  return prisma.$transaction(
+    async (tx) => {
+      await tx.$executeRaw`
+        LOCK TABLE "common_treatments" IN EXCLUSIVE MODE
+      `;
 
-  const treatmentIndex =
-    findTreatmentIndexById(
-      treatments,
-      normalizedId,
-    );
-
-  if (treatmentIndex === -1) {
-    throw appError(
-      "Common treatment not found",
-      404,
-    );
-  }
-
-  const existingTreatment =
-    treatments[treatmentIndex];
-
-  let treatmentName =
-    existingTreatment.treatment_name;
-
-  let fee =
-    existingTreatment.fee;
-
-  if (
-    Object.prototype.hasOwnProperty.call(
-      data || {},
-      "treatment_name",
-    )
-  ) {
-    treatmentName =
-      validateTreatmentName(
-        data.treatment_name,
+      const existing = await findTreatmentById(
+        normalizedId,
+        tx,
       );
-  }
 
-  if (
-    Object.prototype.hasOwnProperty.call(
-      data || {},
-      "fee",
-    )
-  ) {
-    fee =
-      validateFee(data.fee);
-  }
+      if (!existing) {
+        throw appError(
+          "Common treatment not found",
+          404,
+        );
+      }
 
-  const duplicateTreatment =
-    findDuplicateTreatment(
-      treatments,
-      treatmentName,
-      existingTreatment.id,
-    );
+      let treatmentName = normalizeTreatmentName(
+        existing.treatmentName,
+      );
 
-  if (duplicateTreatment) {
-    throw appError(
-      "A common treatment with this name already exists",
-      409,
-    );
-  }
+      let fee = Number(existing.fee ?? 0);
 
-  const updatedTreatment = {
-    ...existingTreatment,
+      if (
+        Object.prototype.hasOwnProperty.call(
+          data || {},
+          "treatment_name",
+        )
+      ) {
+        treatmentName = validateTreatmentName(
+          data.treatment_name,
+        );
+      }
 
-    treatment_name:
-      treatmentName,
+      if (
+        Object.prototype.hasOwnProperty.call(
+          data || {},
+          "fee",
+        )
+      ) {
+        fee = validateFee(data.fee);
+      }
 
-    fee,
+      const treatments = await getAllTreatmentRows(tx);
 
-    updated_at:
-      now(),
-  };
+      const duplicateTreatment = findDuplicateTreatment(
+        treatments,
+        treatmentName,
+        existing.id,
+      );
 
-  treatments[treatmentIndex] =
-    updatedTreatment;
+      if (duplicateTreatment) {
+        throw appError(
+          "A common treatment with this name already exists",
+          409,
+        );
+      }
 
-  await writeSheet(
-    SHEET_NAME,
-    treatments,
+      const updated = await tx.commonTreatment.update({
+        where: {
+          id: existing.id,
+        },
+        data: {
+          treatmentName,
+          fee,
+          updatedAt: now(),
+        },
+      });
+
+      return normalizeTreatment(updated);
+    },
+    {
+      timeout: 15000,
+    },
   );
-
-  return updatedTreatment;
 }
 
-/* --------------------------------------------------------
-   Delete
--------------------------------------------------------- */
+/* ========================================================
+   6. DELETE COMMON TREATMENT
+======================================================== */
 
-export async function deleteCommonTreatment(
-  id,
-) {
-  const normalizedId =
-    normalizeText(id);
+export async function deleteCommonTreatment(id) {
+  const normalizedId = normalizeText(id);
 
   if (!normalizedId) {
     throw appError(
@@ -475,62 +382,53 @@ export async function deleteCommonTreatment(
     );
   }
 
-  const treatments =
-    await getAllTreatmentRows();
+  return prisma.$transaction(
+    async (tx) => {
+      await tx.$executeRaw`
+        LOCK TABLE "common_treatments" IN EXCLUSIVE MODE
+      `;
 
-  const treatmentIndex =
-    findTreatmentIndexById(
-      treatments,
-      normalizedId,
-    );
+      const existing = await findTreatmentById(
+        normalizedId,
+        tx,
+      );
 
-  if (treatmentIndex === -1) {
-    throw appError(
-      "Common treatment not found",
-      404,
-    );
-  }
+      if (!existing) {
+        throw appError(
+          "Common treatment not found",
+          404,
+        );
+      }
 
-  const deletedTreatment =
-    treatments[treatmentIndex];
+      const deleted = await tx.commonTreatment.delete({
+        where: {
+          id: existing.id,
+        },
+      });
 
-  treatments.splice(
-    treatmentIndex,
-    1,
+      return normalizeTreatment(deleted);
+    },
+    {
+      timeout: 15000,
+    },
   );
-
-  await writeSheet(
-    SHEET_NAME,
-    treatments,
-  );
-
-  return deletedTreatment;
 }
 
-/* --------------------------------------------------------
-   Statistics
--------------------------------------------------------- */
+/* ========================================================
+   7. COMMON TREATMENT STATISTICS
+======================================================== */
 
 export async function getCommonTreatmentStatistics() {
-  const treatments =
-    await getAllTreatmentRows();
+  const treatments = await getAllTreatmentRows();
 
   const fees = treatments
-    .map(
-      (treatment) =>
-        Number(treatment.fee),
-    )
-    .filter(
-      (fee) =>
-        Number.isFinite(fee),
-    );
+    .map((treatment) => Number(treatment.fee))
+    .filter((fee) => Number.isFinite(fee));
 
-  const totalFeeValue =
-    fees.reduce(
-      (total, fee) =>
-        total + fee,
-      0,
-    );
+  const totalFeeValue = fees.reduce(
+    (total, fee) => total + fee,
+    0,
+  );
 
   const averageFee =
     fees.length > 0
@@ -538,89 +436,60 @@ export async function getCommonTreatmentStatistics() {
       : 0;
 
   const lowestFee =
-    fees.length > 0
-      ? Math.min(...fees)
-      : 0;
+    fees.length > 0 ? Math.min(...fees) : 0;
 
   const highestFee =
-    fees.length > 0
-      ? Math.max(...fees)
-      : 0;
+    fees.length > 0 ? Math.max(...fees) : 0;
 
   const lowestFeeTreatment =
     treatments.length > 0
-      ? treatments.reduce(
-          (
-            lowest,
-            treatment,
-          ) => {
-            if (
-              Number(
-                treatment.fee,
-              ) <
-              Number(
-                lowest.fee,
-              )
-            ) {
-              return treatment;
-            }
+      ? treatments.reduce((lowest, treatment) => {
+          if (
+            Number(treatment.fee) <
+            Number(lowest.fee)
+          ) {
+            return treatment;
+          }
 
-            return lowest;
-          },
-        )
+          return lowest;
+        })
       : null;
 
   const highestFeeTreatment =
     treatments.length > 0
-      ? treatments.reduce(
-          (
-            highest,
-            treatment,
-          ) => {
-            if (
-              Number(
-                treatment.fee,
-              ) >
-              Number(
-                highest.fee,
-              )
-            ) {
-              return treatment;
-            }
+      ? treatments.reduce((highest, treatment) => {
+          if (
+            Number(treatment.fee) >
+            Number(highest.fee)
+          ) {
+            return treatment;
+          }
 
-            return highest;
-          },
-        )
+          return highest;
+        })
       : null;
 
   return {
-    total_treatments:
-      treatments.length,
+    total_treatments: treatments.length,
 
-    total_fee_value:
-      Number(
-        totalFeeValue.toFixed(2),
-      ),
+    total_fee_value: Number(
+      totalFeeValue.toFixed(2),
+    ),
 
-    average_fee:
-      Number(
-        averageFee.toFixed(2),
-      ),
+    average_fee: Number(
+      averageFee.toFixed(2),
+    ),
 
-    lowest_fee:
-      Number(
-        lowestFee.toFixed(2),
-      ),
+    lowest_fee: Number(
+      lowestFee.toFixed(2),
+    ),
 
-    highest_fee:
-      Number(
-        highestFee.toFixed(2),
-      ),
+    highest_fee: Number(
+      highestFee.toFixed(2),
+    ),
 
-    lowest_fee_treatment:
-      lowestFeeTreatment,
+    lowest_fee_treatment: lowestFeeTreatment,
 
-    highest_fee_treatment:
-      highestFeeTreatment,
+    highest_fee_treatment: highestFeeTreatment,
   };
 }

@@ -1,45 +1,37 @@
 
 import {
-  deleteDriveFile,
-  getDriveFileMetadata,
-  getDriveFileStream,
-} from "./googleDriveService.js";
-
-import {
   uploadMulterFileToS3,
   getS3FileStream,
   deleteS3File,
+  S3_CONFIG,
 } from "./s3Service.js";
 
 import {
   getOrthoMediaFolder,
 } from "../utils/patientMedia.js";
 
-import {
-  writeSheet,
-  readSheet,
-} from "../utils/googleSheets.js";
+import prisma from "../config/prisma.js";
 
 /* ========================================================
    CONFIG
 ======================================================== */
 
-const SHEET_NAME = "Ortho_Media";
-const ORTHO_CASES_SHEET = "Ortho_Cases";
-
 const MAX_FILES = 10;
-
-const STORAGE_PROVIDERS = Object.freeze({
-  S3: "s3",
-  DRIVE: "google_drive",
-});
+const STORAGE_PROVIDER = "s3";
 
 const ENABLE_PERMANENT_DELETE =
   process.env.ENABLE_ORTHO_MEDIA_PERMANENT_DELETE ===
   "true";
 
+/*
+ * Keep the existing advisory lock identifier.
+ * All writers allocating sequential ORM IDs must
+ * use this same PostgreSQL transaction lock.
+ */
+const MEDIA_ID_LOCK = 72819401;
+
 /* ========================================================
-   HELPERS
+   GENERAL HELPERS
 ======================================================== */
 
 const normalize = (value) =>
@@ -59,68 +51,107 @@ const isDeleted = (record) =>
 const matchesId = (a, b) =>
   normalizeLower(a) === normalizeLower(b);
 
-const getStorageProvider = (media) => {
-  const provider = normalizeLower(
-    media.storage_provider,
-  );
+const nowISO = () =>
+  new Date().toISOString();
 
-  if (provider === STORAGE_PROVIDERS.S3) {
-    return STORAGE_PROVIDERS.S3;
-  }
+const todayISO = () =>
+  new Date().toISOString().slice(0, 10);
 
-  if (provider === STORAGE_PROVIDERS.DRIVE) {
-    return STORAGE_PROVIDERS.DRIVE;
-  }
-
-  // Backward compatibility with old Drive records.
-  if (normalize(media.drive_file_id)) {
-    return STORAGE_PROVIDERS.DRIVE;
-  }
-
-  // Compatibility with S3 rows missing provider.
-  if (normalize(media.s3_key)) {
-    return STORAGE_PROVIDERS.S3;
-  }
-
-  throw new Error(
-    "Ortho media storage provider could not be determined",
-  );
+const createError = (message, status = 400) => {
+  const error = new Error(message);
+  error.status = status;
+  error.statusCode = status;
+  return error;
 };
 
 /* ========================================================
-   LOCAL MUTATION QUEUE
-
-   Serializes changes within this Node.js process.
-
-   Does not protect against multiple Render instances
-   or other applications writing to the same sheet.
+   RESPONSE FORMAT — UNCHANGED
 ======================================================== */
 
-let mutationQueue = Promise.resolve();
+const formatOrthoMedia = (record) => {
+  if (!record) return null;
 
-const withOrthoMediaMutation = (operation) => {
-  const result = mutationQueue.then(operation);
+  return {
+    ortho_media_id: record.orthoMediaId,
+    ortho_case_id: record.orthoCaseId,
+    patient_id: record.patientId,
+    ortho_visit_id: record.orthoVisitId ?? "",
 
-  mutationQueue = result.catch(() => {});
+    media_date: record.mediaDate ?? "",
+    media_type: record.mediaType ?? "",
+    category: record.category ?? "",
+    stage: record.stage ?? "",
+    description: record.description ?? "",
 
-  return result;
+    drive_file_id: record.driveFileId ?? "",
+    drive_folder_id: record.driveFolderId ?? "",
+
+    file_name: record.fileName ?? "",
+    mime_type: record.mimeType ?? "",
+    file_size: record.fileSize ?? "",
+
+    uploaded_by: record.uploadedBy ?? "",
+    uploaded_at: record.uploadedAt ?? "",
+
+    is_deleted: record.isDeleted ?? "FALSE",
+
+    storage_provider:
+      record.storageProvider ?? "",
+
+    s3_bucket: record.s3Bucket ?? "",
+    s3_key: record.s3Key ?? "",
+
+    deleted_at: record.deletedAt ?? "",
+  };
 };
 
 /* ========================================================
-   ID GENERATION
+   STORAGE VALIDATION
 ======================================================== */
 
-const generateOrthoMediaId = (rows = []) => {
-  let maxNumber = 0;
-
-  for (const row of rows) {
-    const mediaId = normalize(
-      row.ortho_media_id,
+const ensureS3Media = (media) => {
+  if (!media) {
+    throw createError(
+      "Ortho media not found",
+      404,
     );
+  }
 
-    const match = mediaId.match(
-      /^ORM_(\d+)$/i,
+  if (
+    normalizeLower(media.storage_provider) !==
+      STORAGE_PROVIDER ||
+    !normalize(media.s3_key)
+  ) {
+    throw createError(
+      "This media record does not have a valid S3 object",
+      409,
     );
+  }
+
+  if (
+    normalize(media.s3_bucket) &&
+    normalize(media.s3_bucket) !== S3_CONFIG.bucket
+  ) {
+    throw createError(
+      "Media belongs to a different S3 bucket",
+      409,
+    );
+  }
+
+  return normalize(media.s3_key);
+};
+
+/* ========================================================
+   SAFE SEQUENTIAL MEDIA ID GENERATION
+======================================================== */
+
+const getMaximumMediaNumber = (records = []) => {
+  let maximum = 0;
+
+  for (const record of records) {
+    const id = normalize(record.orthoMediaId);
+
+    const match = id.match(/^ORM_(\d+)$/i);
 
     if (!match) continue;
 
@@ -128,16 +159,27 @@ const generateOrthoMediaId = (rows = []) => {
 
     if (
       Number.isSafeInteger(number) &&
-      number > maxNumber
+      number > maximum
     ) {
-      maxNumber = number;
+      maximum = number;
     }
   }
 
-  return `ORM_${String(maxNumber + 1).padStart(
-    6,
-    "0",
-  )}`;
+  return maximum;
+};
+
+const formatMediaId = (number) => {
+  if (
+    !Number.isSafeInteger(number) ||
+    number < 1
+  ) {
+    throw createError(
+      "Invalid media ID sequence",
+      500,
+    );
+  }
+
+  return `ORM_${String(number).padStart(6, "0")}`;
 };
 
 /* ========================================================
@@ -147,7 +189,8 @@ const generateOrthoMediaId = (rows = []) => {
 const sanitizeFileName = (value) =>
   normalize(value)
     .replace(/[^\w.-]+/g, "_")
-    .replace(/_+/g, "_");
+    .replace(/_+/g, "_")
+    .slice(0, 170);
 
 const getFileExtension = (fileName) => {
   const match = normalize(fileName).match(
@@ -159,12 +202,12 @@ const getFileExtension = (fileName) => {
     : "";
 };
 
-/* ========================================================
-   BUILD FILE NAME
-======================================================== */
-
+/*
+ * R2 filenames do not require a sequential ORM ID.
+ * The S3-compatible storage service generates a UUID
+ * object key independently.
+ */
 const buildOrthoFileName = ({
-  mediaId,
   patientId,
   caseId,
   visitId,
@@ -176,10 +219,7 @@ const buildOrthoFileName = ({
   const extension =
     getFileExtension(originalName);
 
-  const date = new Date()
-    .toISOString()
-    .slice(0, 10)
-    .replaceAll("-", "");
+  const date = todayISO().replaceAll("-", "");
 
   const parts = [
     patientId,
@@ -189,94 +229,194 @@ const buildOrthoFileName = ({
     mediaType,
     category,
     stage,
-    mediaId,
   ].filter(Boolean);
 
-  return sanitizeFileName(
-    `${parts.join("_")}${extension}`,
-  );
+  const baseName =
+    sanitizeFileName(parts.join("_")) ||
+    "ortho_media";
+
+  return `${baseName.slice(0, 150)}${extension}`;
 };
 
 /* ========================================================
-   GET ALL RECORDS
+   DATABASE HELPERS
+======================================================== */
+
+const findMediaById = async (
+  mediaId,
+  db = prisma,
+) => {
+  if (!normalize(mediaId)) {
+    return null;
+  }
+
+  return db.orthoMedia.findFirst({
+    where: {
+      orthoMediaId: {
+        equals: normalize(mediaId),
+        mode: "insensitive",
+      },
+    },
+  });
+};
+
+const findOrthoCase = async (
+  caseId,
+  db = prisma,
+) => {
+  if (!normalize(caseId)) {
+    return null;
+  }
+
+  return db.orthoCase.findFirst({
+    where: {
+      orthoCaseId: {
+        equals: normalize(caseId),
+        mode: "insensitive",
+      },
+    },
+  });
+};
+
+/* ========================================================
+   UPLOAD RECOVERY HELPERS
+======================================================== */
+
+/*
+ * Never delete an uploaded object unless we can
+ * verify that PostgreSQL has no reference to it.
+ *
+ * This protects against uncertain transaction
+ * commit outcomes.
+ */
+const reconcileFailedUpload = async (
+  uploadedKeys,
+) => {
+  if (!uploadedKeys.length) {
+    return;
+  }
+
+  let referencedKeys;
+
+  try {
+    const records =
+      await prisma.orthoMedia.findMany({
+        where: {
+          s3Key: {
+            in: uploadedKeys,
+          },
+        },
+        select: {
+          s3Key: true,
+        },
+      });
+
+    referencedKeys = new Set(
+      records
+        .map((record) => normalize(record.s3Key))
+        .filter(Boolean),
+    );
+  } catch (error) {
+    console.error(
+      "Unable to verify failed upload against database. " +
+      "Preserving R2 objects for reconciliation.",
+      {
+        keys: uploadedKeys,
+        error: error.message,
+      },
+    );
+
+    return;
+  }
+
+  for (const key of uploadedKeys) {
+    if (referencedKeys.has(key)) {
+      console.warn(
+        "Preserving R2 object referenced by database:",
+        key,
+      );
+
+      continue;
+    }
+
+    try {
+      await deleteS3File(key);
+
+      console.info(
+        "Cleaned unreferenced R2 upload:",
+        key,
+      );
+    } catch (error) {
+      console.error(
+        "R2 upload cleanup failed. " +
+        "Manual reconciliation required.",
+        {
+          key,
+          error: error.message,
+        },
+      );
+    }
+  }
+};
+
+/* ========================================================
+   1. GET ALL RECORDS
 ======================================================== */
 
 export const getAllOrthoMediaRecords =
   async ({ forceRefresh = false } = {}) => {
-    return (
-      (await readSheet(SHEET_NAME, {
-        forceRefresh,
-      })) || []
-    );
+    void forceRefresh;
+
+    const records =
+      await prisma.orthoMedia.findMany();
+
+    return records.map(formatOrthoMedia);
   };
 
 /* ========================================================
-   GET ACTIVE RECORDS
+   2. GET ACTIVE RECORDS
 ======================================================== */
 
 export const getActiveOrthoMediaRecords =
   async () => {
-    const rows =
-      await getAllOrthoMediaRecords();
+    const records =
+      await prisma.orthoMedia.findMany({
+        where: {
+          OR: [
+            { isDeleted: null },
+            { isDeleted: "" },
+            { isDeleted: "FALSE" },
+            { isDeleted: "false" },
+            { isDeleted: "0" },
+          ],
+        },
+      });
 
-    return rows.filter(
-      (row) => !isDeleted(row),
-    );
+    return records
+      .map(formatOrthoMedia)
+      .filter((record) => !isDeleted(record));
   };
 
 /* ========================================================
-   GET ORTHO CASE
-======================================================== */
-
-const getOrthoCase = async (caseId) => {
-  const rows =
-    (await readSheet(ORTHO_CASES_SHEET)) || [];
-
-  return (
-    rows.find((row) =>
-      matchesId(
-        row.ortho_case_id,
-        caseId,
-      )
-    ) || null
-  );
-};
-
-/* ========================================================
-   GET MEDIA BY ID
-
-   Preserves existing export used by controller.
+   3. GET MEDIA BY ID
 ======================================================== */
 
 export const getOrthoMediaByIdService =
   async (mediaId) => {
-    if (!normalize(mediaId)) {
-      return null;
-    }
+    const record =
+      await findMediaById(mediaId);
 
-    const rows =
-      await getAllOrthoMediaRecords();
-
-    return (
-      rows.find((row) =>
-        matchesId(
-          row.ortho_media_id,
-          mediaId,
-        )
-      ) || null
-    );
+    return formatOrthoMedia(record);
   };
 
 /* ========================================================
-   GET ACTIVE MEDIA BY ID
+   4. GET ACTIVE MEDIA BY ID
 ======================================================== */
 
 export const getOrthoMediaById =
   async (mediaId) => {
     const media =
-      await getOrthoMediaByIdService(
-        mediaId,
-      );
+      await getOrthoMediaByIdService(mediaId);
 
     if (!media || isDeleted(media)) {
       return null;
@@ -286,108 +426,119 @@ export const getOrthoMediaById =
   };
 
 /* ========================================================
-   GET MEDIA BY CASE
+   5. GET MEDIA BY CASE
 ======================================================== */
 
 export const getOrthoMediaByCaseService =
   async (caseId, filters = {}) => {
-    const rows =
-      await getActiveOrthoMediaRecords();
-
-    let result = rows.filter((row) =>
-      matchesId(
-        row.ortho_case_id,
-        caseId,
-      )
-    );
-
-    if (normalize(filters.media_type)) {
-      result = result.filter((row) =>
-        matchesId(
-          row.media_type,
-          filters.media_type,
-        )
-      );
+    if (!normalize(caseId)) {
+      return [];
     }
 
-    if (normalize(filters.stage)) {
-      result = result.filter((row) =>
-        matchesId(
-          row.stage,
-          filters.stage,
-        )
+    const records =
+      await prisma.orthoMedia.findMany({
+        where: {
+          orthoCaseId: {
+            equals: normalize(caseId),
+            mode: "insensitive",
+          },
+
+          ...(normalize(filters.media_type)
+            ? {
+                mediaType: {
+                  equals: normalize(filters.media_type),
+                  mode: "insensitive",
+                },
+              }
+            : {}),
+
+          ...(normalize(filters.stage)
+            ? {
+                stage: {
+                  equals: normalize(filters.stage),
+                  mode: "insensitive",
+                },
+              }
+            : {}),
+
+          ...(normalize(filters.visit_id)
+            ? {
+                orthoVisitId: {
+                  equals: normalize(filters.visit_id),
+                  mode: "insensitive",
+                },
+              }
+            : {}),
+        },
+      });
+
+    return records
+      .map(formatOrthoMedia)
+      .filter((record) => !isDeleted(record))
+      .sort(
+        (a, b) =>
+          (Date.parse(b.uploaded_at) || 0) -
+          (Date.parse(a.uploaded_at) || 0),
       );
-    }
-
-    if (normalize(filters.visit_id)) {
-      result = result.filter((row) =>
-        matchesId(
-          row.ortho_visit_id,
-          filters.visit_id,
-        )
-      );
-    }
-
-    return result.sort((a, b) => {
-      const dateA =
-        new Date(a.uploaded_at || 0).getTime() || 0;
-
-      const dateB =
-        new Date(b.uploaded_at || 0).getTime() || 0;
-
-      return dateB - dateA;
-    });
   };
 
 /* ========================================================
-   GET MEDIA BY PATIENT
+   6. GET MEDIA BY PATIENT
 ======================================================== */
 
 export const getOrthoMediaByPatientIdService =
   async (patientId) => {
-    const rows =
-      await getActiveOrthoMediaRecords();
+    if (!normalize(patientId)) {
+      return [];
+    }
 
-    return rows
-      .filter((row) =>
-        matchesId(
-          row.patient_id,
-          patientId,
-        )
-      )
-      .sort((a, b) => {
-        const dateA =
-          new Date(a.uploaded_at || 0).getTime() || 0;
-
-        const dateB =
-          new Date(b.uploaded_at || 0).getTime() || 0;
-
-        return dateB - dateA;
+    const records =
+      await prisma.orthoMedia.findMany({
+        where: {
+          patientId: {
+            equals: normalize(patientId),
+            mode: "insensitive",
+          },
+        },
       });
+
+    return records
+      .map(formatOrthoMedia)
+      .filter((record) => !isDeleted(record))
+      .sort(
+        (a, b) =>
+          (Date.parse(b.uploaded_at) || 0) -
+          (Date.parse(a.uploaded_at) || 0),
+      );
   };
 
 /* ========================================================
-   GET MEDIA BY VISIT
+   7. GET MEDIA BY VISIT
 ======================================================== */
 
 export const getOrthoMediaByVisitService =
   async (visitId) => {
-    const rows =
-      await getActiveOrthoMediaRecords();
+    if (!normalize(visitId)) {
+      return [];
+    }
 
-    return rows.filter((row) =>
-      matchesId(
-        row.ortho_visit_id,
-        visitId,
-      )
-    );
+    const records =
+      await prisma.orthoMedia.findMany({
+        where: {
+          orthoVisitId: {
+            equals: normalize(visitId),
+            mode: "insensitive",
+          },
+        },
+      });
+
+    return records
+      .map(formatOrthoMedia)
+      .filter((record) => !isDeleted(record));
   };
 
 /* ========================================================
-   CREATE / UPLOAD ORTHO MEDIA
-
-   NEW FILES -> AMAZON S3
-   METADATA  -> GOOGLE SHEETS
+   8. CREATE / UPLOAD ORTHO MEDIA
 ======================================================== */
 
 export const createOrthoMediaService =
@@ -402,555 +553,477 @@ export const createOrthoMediaService =
     description = "",
     uploadedBy = "",
   }) => {
-    return withOrthoMediaMutation(async () => {
-      /* --------------------------------------------------
-         VALIDATION
-      -------------------------------------------------- */
+    /* ----------------------------------------------------
+       VALIDATION
+    ---------------------------------------------------- */
+
+    if (
+      !Array.isArray(files) ||
+      files.length === 0
+    ) {
+      throw createError(
+        "At least one file is required",
+      );
+    }
+
+    if (files.length > MAX_FILES) {
+      throw createError(
+        "Maximum 10 files are allowed",
+      );
+    }
+
+    if (!normalize(caseId)) {
+      throw createError(
+        "Ortho case ID is required",
+      );
+    }
+
+    if (!normalize(mediaType)) {
+      throw createError(
+        "Media type is required",
+      );
+    }
+
+    for (const file of files) {
+      if (
+        !file ||
+        !Buffer.isBuffer(file.buffer) ||
+        file.buffer.length === 0
+      ) {
+        throw createError(
+          "Invalid file buffer. Multer must use memoryStorage().",
+        );
+      }
 
       if (
-        !Array.isArray(files) ||
-        files.length === 0
+        file.buffer.length >
+        S3_CONFIG.maxFileSize
       ) {
-        throw new Error(
-          "At least one file is required",
+        throw createError(
+          "File exceeds the 10 MB limit",
         );
       }
+    }
 
-      if (files.length > MAX_FILES) {
-        throw new Error(
-          "Maximum 10 files are allowed",
-        );
-      }
+    /* ----------------------------------------------------
+       FIND CASE
+    ---------------------------------------------------- */
 
-      if (!normalize(caseId)) {
-        throw new Error(
-          "Ortho case ID is required",
-        );
-      }
+    const orthoCase =
+      await findOrthoCase(caseId);
 
-      if (!normalize(mediaType)) {
-        throw new Error(
-          "Media type is required",
-        );
-      }
+    if (!orthoCase) {
+      throw createError(
+        "Ortho case not found",
+        404,
+      );
+    }
 
-      for (const file of files) {
-        if (
-          !file ||
-          !Buffer.isBuffer(file.buffer) ||
-          file.buffer.length === 0
-        ) {
-          throw new Error(
-            "Invalid file buffer. Multer must use memoryStorage().",
-          );
-        }
-      }
+    const patientId =
+      normalize(orthoCase.patientId);
 
-      /* --------------------------------------------------
-         GET CASE
-      -------------------------------------------------- */
+    if (!patientId) {
+      throw createError(
+        "Patient ID is missing from Ortho case",
+      );
+    }
 
-      const orthoCase =
-        await getOrthoCase(caseId);
+    /* ----------------------------------------------------
+       VALIDATE VISIT
+    ---------------------------------------------------- */
 
-      if (!orthoCase) {
-        throw new Error(
-          "Ortho case not found",
-        );
-      }
+    let resolvedVisitId = "";
 
-      const patientId =
-        normalize(orthoCase.patient_id);
-
-      if (!patientId) {
-        throw new Error(
-          "Patient ID is missing from Ortho case",
-        );
-      }
-
-      /*
-       * Validate the visit-to-case relationship before
-       * recording an ortho_visit_id if supplied.
-       *
-       * This must be enforced using your existing
-       * Ortho_Visits lookup/authorization logic.
-       */
-
-      /* --------------------------------------------------
-         GET FRESH ROWS
-      -------------------------------------------------- */
-
-      const rows =
-        await getAllOrthoMediaRecords({
-          forceRefresh: true,
+    if (normalize(visitId)) {
+      const visit =
+        await prisma.orthoVisit.findFirst({
+          where: {
+            orthoVisitId: {
+              equals: normalize(visitId),
+              mode: "insensitive",
+            },
+          },
         });
 
-      const nextRows = [...rows];
-      const newRecords = [];
-      const uploadedKeys = [];
-
-      let sheetWriteStarted = false;
-
-      try {
-        /* =================================================
-           FILE LOOP
-        ================================================= */
-
-        for (const file of files) {
-          const mediaId =
-            generateOrthoMediaId(nextRows);
-
-          const fileName =
-            buildOrthoFileName({
-              mediaId,
-              patientId,
-              caseId,
-              visitId,
-              mediaType,
-              category,
-              stage,
-              originalName: file.originalname,
-            });
-
-          /*
-           * Reuse existing category helper.
-           */
-          const categoryFolder =
-            getOrthoMediaFolder(mediaType);
-
-          /* -----------------------------------------------
-             AWS S3 UPLOAD
-          ----------------------------------------------- */
-
-          const uploaded =
-            await uploadMulterFileToS3({
-              file,
-              fileName,
-              patientId,
-              categoryFolder:
-                `ortho_${categoryFolder || "general"}`,
-            });
-
-          uploadedKeys.push(uploaded.key);
-
-          /* -----------------------------------------------
-             GOOGLE SHEET RECORD
-          ----------------------------------------------- */
-
-          const record = {
-            ortho_media_id: mediaId,
-
-            ortho_case_id:
-              normalize(caseId),
-
-            patient_id:
-              patientId,
-
-            ortho_visit_id:
-              normalize(visitId),
-
-            media_date:
-              normalize(mediaDate) ||
-              new Date()
-                .toISOString()
-                .slice(0, 10),
-
-            media_type:
-              normalize(mediaType),
-
-            category:
-              normalize(category),
-
-            stage:
-              normalize(stage),
-
-            description:
-              normalize(description),
-
-            // Legacy Google Drive fields
-            drive_file_id: "",
-            drive_folder_id: "",
-
-            file_name:
-              normalize(uploaded.name),
-
-            mime_type:
-              normalize(uploaded.mimeType),
-
-            file_size:
-              normalize(uploaded.size),
-
-            uploaded_by:
-              normalize(uploadedBy),
-
-            uploaded_at:
-              new Date().toISOString(),
-
-            is_deleted: "FALSE",
-
-            // New AWS S3 fields
-            storage_provider:
-              STORAGE_PROVIDERS.S3,
-
-            s3_bucket:
-              normalize(uploaded.bucket),
-
-            s3_key:
-              normalize(uploaded.key),
-
-            deleted_at: "",
-          };
-
-          nextRows.push(record);
-          newRecords.push(record);
-        }
-
-        /* --------------------------------------------------
-           SAVE ALL METADATA
-        -------------------------------------------------- */
-
-        sheetWriteStarted = true;
-
-        await writeSheet(
-          SHEET_NAME,
-          nextRows,
+      if (
+        !visit ||
+        !matchesId(
+          visit.orthoCaseId,
+          orthoCase.orthoCaseId,
+        )
+      ) {
+        throw createError(
+          "Ortho visit does not belong to this case",
+          400,
         );
+      }
 
-        return newRecords;
-      } catch (error) {
-        console.error(
-          "Ortho media upload failed:",
-          error.name,
-          error.message,
-        );
+      resolvedVisitId = visit.orthoVisitId;
+    }
 
-        /*
-         * Before a Sheet write starts, successful uploads
-         * from this request can be cleaned up.
-         *
-         * After writing starts, the result may be
-         * uncertain. Retain uploaded objects and
-         * reconcile them with the sheet.
-         */
-        if (!sheetWriteStarted) {
-          for (const key of uploadedKeys) {
-            try {
-              await deleteS3File(key);
-            } catch (cleanupError) {
-              console.error(
-                "Failed to clean orphan S3 object:",
-                cleanupError.message,
+    /* ----------------------------------------------------
+       PHASE 1 — UPLOAD TO R2
+       NO DATABASE TRANSACTION
+    ---------------------------------------------------- */
+
+    const uploadedFiles = [];
+    const uploadedKeys = [];
+
+    try {
+      const categoryFolder =
+        getOrthoMediaFolder(mediaType);
+
+      for (const file of files) {
+        const fileName =
+          buildOrthoFileName({
+            patientId,
+            caseId: orthoCase.orthoCaseId,
+            visitId: resolvedVisitId,
+            mediaType,
+            category,
+            stage,
+            originalName: file.originalname,
+          });
+
+        const uploaded =
+          await uploadMulterFileToS3({
+            file,
+            fileName,
+            patientId,
+            categoryFolder:
+              `ortho_${categoryFolder || "general"}`,
+          });
+
+        uploadedFiles.push(uploaded);
+        uploadedKeys.push(uploaded.key);
+      }
+
+      /* ------------------------------------------------
+         PHASE 2 — SHORT DATABASE TRANSACTION
+      ------------------------------------------------ */
+
+      const newRecords =
+        await prisma.$transaction(
+          async (tx) => {
+            await tx.$executeRaw`
+              SELECT pg_advisory_xact_lock(
+                ${MEDIA_ID_LOCK}
+              )
+            `;
+
+            const existing =
+              await tx.orthoMedia.findMany({
+                select: {
+                  orthoMediaId: true,
+                },
+              });
+
+            const maximum =
+              getMaximumMediaNumber(existing);
+
+            const createdRecords = [];
+
+            for (
+              let index = 0;
+              index < uploadedFiles.length;
+              index++
+            ) {
+              const uploaded =
+                uploadedFiles[index];
+
+              const mediaId =
+                formatMediaId(
+                  maximum + index + 1,
+                );
+
+              const created =
+                await tx.orthoMedia.create({
+                  data: {
+                    orthoMediaId: mediaId,
+
+                    orthoCaseId:
+                      orthoCase.orthoCaseId,
+
+                    patientId,
+
+                    orthoVisitId:
+                      resolvedVisitId,
+
+                    mediaDate:
+                      normalize(mediaDate) ||
+                      todayISO(),
+
+                    mediaType:
+                      normalize(mediaType),
+
+                    category:
+                      normalize(category),
+
+                    stage:
+                      normalize(stage),
+
+                    description:
+                      normalize(description),
+
+                    driveFileId: "",
+                    driveFolderId: "",
+
+                    fileName:
+                      normalize(uploaded.name),
+
+                    mimeType:
+                      normalize(uploaded.mimeType),
+
+                    fileSize:
+                      normalize(uploaded.size),
+
+                    uploadedBy:
+                      normalize(uploadedBy),
+
+                    uploadedAt:
+                      nowISO(),
+
+                    isDeleted: "FALSE",
+
+                    storageProvider:
+                      STORAGE_PROVIDER,
+
+                    s3Bucket:
+                      normalize(uploaded.bucket),
+
+                    s3Key:
+                      normalize(uploaded.key),
+
+                    deletedAt: "",
+                  },
+                });
+
+              createdRecords.push(
+                formatOrthoMedia(created),
               );
             }
-          }
-        } else {
-          console.error(
-            "Ortho media Sheet/S3 reconciliation required.",
-            {
-              mediaIds: newRecords.map(
-                (record) => record.ortho_media_id,
-              ),
-              objectCount: uploadedKeys.length,
-            },
-          );
-        }
 
-        throw error;
-      }
-    });
+            return createdRecords;
+          },
+          {
+            maxWait: 10000,
+            timeout: 15000,
+          },
+        );
+
+      return newRecords;
+    } catch (error) {
+      /*
+       * Uploads and database transactions are
+       * separate operations.
+       *
+       * Verify database references before
+       * attempting cleanup.
+       */
+      await reconcileFailedUpload(
+        uploadedKeys,
+      );
+
+      throw error;
+    }
   };
 
 /* ========================================================
-   GET FILE STREAM
-
-   AWS S3 + LEGACY GOOGLE DRIVE
+   9. GET FILE STREAM
 ======================================================== */
 
 export const getOrthoMediaFileStream =
   async (mediaId) => {
     const media =
-      await getOrthoMediaByIdService(mediaId);
+      await getOrthoMediaById(mediaId);
 
-    if (!media || isDeleted(media)) {
+    if (!media) {
       return null;
     }
 
-    const provider =
-      getStorageProvider(media);
+    const key = ensureS3Media(media);
 
-    /* ---------------- AWS S3 ---------------- */
-
-    if (provider === STORAGE_PROVIDERS.S3) {
-      const key = normalize(media.s3_key);
-
-      if (!key) {
-        throw new Error(
-          "Ortho media S3 object key is missing",
-        );
-      }
-
-      const result =
-        await getS3FileStream(key);
-
-      return {
-        media,
-
-        metadata: {
-          ...result.metadata,
-
-          name:
-            media.file_name ||
-            result.metadata.name,
-        },
-
-        stream: result.stream,
-      };
-    }
-
-    /* ---------------- GOOGLE DRIVE ---------------- */
-
-    const driveFileId =
-      normalize(media.drive_file_id);
-
-    if (!driveFileId) {
-      throw new Error(
-        "Ortho media Drive file ID is missing",
-      );
-    }
-
-    const metadata =
-      await getDriveFileMetadata(driveFileId);
-
-    const stream =
-      await getDriveFileStream(driveFileId);
+    const result =
+      await getS3FileStream(key);
 
     return {
       media,
-      metadata,
-      stream,
+
+      metadata: {
+        ...result.metadata,
+
+        name:
+          media.file_name ||
+          result.metadata.name,
+      },
+
+      stream: result.stream,
     };
   };
 
 /* ========================================================
-   SOFT DELETE
-
-   Metadata only.
-   Files remain in their storage provider.
+   10. SOFT DELETE
 ======================================================== */
 
 export const deleteOrthoMediaService =
   async (mediaId) => {
-    return withOrthoMediaMutation(async () => {
-      const rows =
-        await getAllOrthoMediaRecords({
-          forceRefresh: true,
-        });
+    const existing =
+      await findMediaById(mediaId);
 
-      const index = rows.findIndex((row) =>
-        matchesId(
-          row.ortho_media_id,
-          mediaId,
-        )
-      );
+    if (!existing) {
+      return null;
+    }
 
-      if (index === -1) {
-        return null;
-      }
+    if (
+      isDeleted(formatOrthoMedia(existing))
+    ) {
+      return formatOrthoMedia(existing);
+    }
 
-      if (isDeleted(rows[index])) {
-        return rows[index];
-      }
+    const updated =
+      await prisma.orthoMedia.update({
+        where: {
+          orthoMediaId:
+            existing.orthoMediaId,
+        },
 
-      rows[index] = {
-        ...rows[index],
+        data: {
+          isDeleted: "TRUE",
+          deletedAt: nowISO(),
+        },
+      });
 
-        is_deleted: "TRUE",
-
-        deleted_at:
-          new Date().toISOString(),
-      };
-
-      await writeSheet(
-        SHEET_NAME,
-        rows,
-      );
-
-      return rows[index];
-    });
+    return formatOrthoMedia(updated);
   };
 
 /* ========================================================
-   DELETE PHYSICAL FILE
-======================================================== */
-
-
-
-
-/* ========================================================
-   PERMANENT DELETE
-
-   Disabled by default.
-
-   Requires administrative authorization,
-   retention checks and audit logging.
+   11. PERMANENT DELETE
 ======================================================== */
 
 export const permanentlyDeleteOrthoMediaService =
   async (mediaId) => {
     if (!ENABLE_PERMANENT_DELETE) {
-      const error = new Error(
+      throw createError(
         "Permanent Ortho media deletion is disabled",
+        403,
       );
-
-      error.status = 403;
-
-      throw error;
     }
 
-    return withOrthoMediaMutation(async () => {
-      const rows =
-        await getAllOrthoMediaRecords({
-          forceRefresh: true,
-        });
+    const existing =
+      await findMediaById(mediaId);
 
-      const index = rows.findIndex((row) =>
-        matchesId(
-          row.ortho_media_id,
-          mediaId,
-        )
-      );
+    if (!existing) {
+      return null;
+    }
 
-      if (index === -1) {
-        return null;
-      }
+    const media =
+      formatOrthoMedia(existing);
 
-      let media = rows[index];
+    const key = ensureS3Media(media);
 
-      /*
-       * Mark the record as deleted first.
-       */
-      if (!isDeleted(media)) {
-        media = {
-          ...media,
+    /*
+     * Preserve the existing permanent-deletion
+     * behavior and response.
+     *
+     * R2 deletion occurs outside transactions.
+     */
+    await prisma.orthoMedia.update({
+      where: {
+        orthoMediaId:
+          existing.orthoMediaId,
+      },
 
-          is_deleted: "TRUE",
-
-          deleted_at:
-            new Date().toISOString(),
-        };
-
-        rows[index] = media;
-
-        await writeSheet(
-          SHEET_NAME,
-          rows,
-        );
-      }
-
-      /*
-       * Delete the current stored object.
-       * S3 versioned objects may retain old versions.
-       */
-     
-      
-
-      /*
-       * Remove metadata after storage operation.
-       */
-      const remainingRows = rows.filter(
-        (row) =>
-          !matchesId(
-            row.ortho_media_id,
-            mediaId,
-          ),
-      );
-
-      await writeSheet(
-        SHEET_NAME,
-        remainingRows,
-      );
-
-      return media;
+      data: {
+        isDeleted: "TRUE",
+        deletedAt:
+          existing.deletedAt ||
+          nowISO(),
+      },
     });
+
+    await deleteS3File(key);
+
+    await prisma.orthoMedia.delete({
+      where: {
+        orthoMediaId:
+          existing.orthoMediaId,
+      },
+    });
+
+    return media;
   };
 
-  /* ========================================================
-   PERMANENTLY DELETE ALL ORTHO MEDIA BY CASE
+/* ========================================================
+   12. DELETE ALL MEDIA BY CASE
 ======================================================== */
 
-export const deleteAllOrthoMediaByCaseService = async (caseId) => {
-  /* ----------------------------------------------------
-     VALIDATE
-  ---------------------------------------------------- */
-
-  const normalizedCaseId = normalize(caseId);
-
-  if (!normalizedCaseId) {
-    throw new Error("Ortho case ID is required");
-  }
-
-  if (!ENABLE_PERMANENT_DELETE) {
-    const error = new Error(
-      "Permanent Ortho media deletion is disabled"
-    );
-
-    error.status = 403;
-
-    throw error;
-  }
-
-  /* ----------------------------------------------------
-     GET ALL MEDIA INCLUDING SOFT-DELETED
-  ---------------------------------------------------- */
-
-  const allMedia = await getAllOrthoMediaRecords({
-    forceRefresh: true,
-  });
-
-  const relatedMedia = allMedia.filter((row) =>
-    matchesId(row.ortho_case_id, normalizedCaseId)
-  );
-
-  /* ----------------------------------------------------
-     DELETE EACH FILE AND ITS METADATA
-  ---------------------------------------------------- */
-
-  const deletedMediaIds = [];
-
-  for (const media of relatedMedia) {
-    try {
-      const deleted = await permanentlyDeleteOrthoMediaService(
-        media.ortho_media_id
+export const deleteAllOrthoMediaByCaseService =
+  async (caseId) => {
+    if (!normalize(caseId)) {
+      throw createError(
+        "Ortho case ID is required",
       );
+    }
 
-      if (deleted) {
-        deletedMediaIds.push(media.ortho_media_id);
-      }
-    } catch (error) {
-      console.error("Failed to delete Ortho media:", {
-        caseId: normalizedCaseId,
-        mediaId: media.ortho_media_id,
-        error: error.message,
+    if (!ENABLE_PERMANENT_DELETE) {
+      throw createError(
+        "Permanent Ortho media deletion is disabled",
+        403,
+      );
+    }
+
+    const records =
+      await prisma.orthoMedia.findMany({
+        where: {
+          orthoCaseId: {
+            equals: normalize(caseId),
+            mode: "insensitive",
+          },
+        },
       });
 
-      // Stop immediately. Preserve remaining records
-      // so the deletion can be investigated or retried.
-      error.status = error.status || 500;
-      error.deleted_media_ids = deletedMediaIds;
+    const deletedMediaIds = [];
 
-      throw error;
+    for (const record of records) {
+      try {
+        const deleted =
+          await permanentlyDeleteOrthoMediaService(
+            record.orthoMediaId,
+          );
+
+        if (deleted) {
+          deletedMediaIds.push(
+            record.orthoMediaId,
+          );
+        }
+      } catch (error) {
+        console.error(
+          "Failed to delete Ortho media:",
+          {
+            caseId,
+            mediaId:
+              record.orthoMediaId,
+            error: error.message,
+          },
+        );
+
+        error.status =
+          error.status || 500;
+
+        error.deleted_media_ids =
+          deletedMediaIds;
+
+        throw error;
+      }
     }
-  }
 
-  /* ----------------------------------------------------
-     RESULT
-  ---------------------------------------------------- */
+    return {
+      case_id: caseId,
 
-  return {
-    case_id: caseId,
+      deleted_count:
+        deletedMediaIds.length,
 
-    deleted_count: deletedMediaIds.length,
-
-    deleted_media_ids: deletedMediaIds,
+      deleted_media_ids:
+        deletedMediaIds,
+    };
   };
-};
